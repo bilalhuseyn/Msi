@@ -1,0 +1,50 @@
+{
+    "$schema": "https://json.schemastore.org/nest-cli",
+    "collection": "@nestjs/schematics",
+    "sourceRoot": "apps/core-engine/src",
+    "compilerOptions": {
+        "deleteOutDir": true,
+        "webpack": true,
+        "tsConfigPath": "tsconfig.build.json"
+    },
+    "monorepo": true,
+    "root": "apps/core-engine",
+    "projects": {
+        "core-engine": {
+            "type": "application",
+            "root": "apps/core-engine",
+            "entryFile": "main",
+            "sourceRoot": "apps/core-engine/src",
+            "compilerOptions": {
+                "tsConfigPath": "apps/core-engine/tsconfig.app.json"
+            }
+        },
+        "mock-exchange": {
+            "type": "application",
+            "root": "apps/mock-exchange",
+            "entryFile": "main",
+            "sourceRoot": "apps/mock-exchange/src",
+            "compilerOptions": {
+                "tsConfigPath": "apps/mock-exchange/tsconfig.app.json"
+            }
+        },
+        "mock-bank": {
+            "type": "application",
+            "root": "apps/mock-bank",
+            "entryFile": "main",
+            "sourceRoot": "apps/mock-bank/src",
+            "compilerOptions": {
+                "tsConfigPath": "apps/mock-bank/tsconfig.app.json"
+            }
+        },
+        "shared-types": {
+            "type": "library",
+            "root": "libs/shared-types",
+            "entryFile": "index",
+            "sourceRoot": "libs/shared-types/src",
+            "compilerOptions": {
+                "tsConfigPath": "libs/shared-types/tsconfig.lib.json"
+            }
+        }
+    }
+}
