@@ -32,12 +32,17 @@ def _real_ob_settings():
     """
     Settings calibrated for real order book data (Tardis book_snapshot_25).
 
-    Phase 1 fixes applied:
+    Phase 1-3 fixes applied:
     - P1: VETO is entry-gate only (handled in CE + sim_engine)
     - P2: VPIN uses dynamic bucket sizing (bucket_size=500 BTC baseline)
     - P4: Spread is confidence multiplier (handled in CE, removed from weights)
     - P5: Options regime = NEUTRAL (default in settings.py)
     - VPIN veto at 0.90 with sustained confirmation (3 consecutive readings)
+
+    Phase 4 / P15 fixes:
+    - taker_fee_pct=0.0002: maker orders (0.02%) vs taker (0.1%)
+    - slippage_pct=0.0001: limit orders have near-zero slippage
+    - tp1_rr=2.0: first target at 2R (was 1.5R) to improve avg win/loss
     """
     vpin = VPINSettings(
         bucket_size=500.0,
@@ -58,6 +63,9 @@ def _real_ob_settings():
     )
     bt = BacktestSettings(
         cooldown_seconds=600,
+        taker_fee_pct=0.0002,   # P15: maker orders (0.02% vs 0.1% taker)
+        slippage_pct=0.0001,    # P15: limit order slippage near-zero
+        tp1_rr=2.0,             # P15: 2R first target (was 1.5R)
     )
     return obi, vpin, ce, bt
 
