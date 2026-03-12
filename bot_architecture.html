@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OBI Pro — Decision Making Architecture</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e17;
+  --bg2: #111827;
+  --bg3: #1e293b;
+  --accent-cyan: #06b6d4;
+  --accent-green: #10b981;
+  --accent-amber: #f59e0b;
+  --accent-red: #ef4444;
+  --accent-purple: #8b5cf6;
+  --accent-blue: #3b82f6;
+  --text: #e2e8f0;
+  --text-dim: #94a3b8;
+  --border: #334155;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Space Grotesk', sans-serif;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.container {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 40px 20px;
+}
+h1 {
+  font-size: 2.2rem;
+  font-weight: 700;
+  text-align: center;
+  margin-bottom: 8px;
+  background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.subtitle {
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 0.95rem;
+  margin-bottom: 50px;
+}
+.flow {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+.arrow-down {
+  width: 2px;
+  height: 36px;
+  background: linear-gradient(to bottom, var(--border), var(--accent-cyan));
+  position: relative;
+}
+.arrow-down::after {
+  content: '▼';
+  position: absolute;
+  bottom: -12px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--accent-cyan);
+  font-size: 12px;
+}
+.arrow-down.red { background: linear-gradient(to bottom, var(--border), var(--accent-red)); }
+.arrow-down.red::after { color: var(--accent-red); }
+.arrow-down.green { background: linear-gradient(to bottom, var(--border), var(--accent-green)); }
+.arrow-down.green::after { color: var(--accent-green); }
+.arrow-down.amber { background: linear-gradient(to bottom, var(--border), var(--accent-amber)); }
+.arrow-down.amber::after { color: var(--accent-amber); }
+.arrow-down.purple { background: linear-gradient(to bottom, var(--border), var(--accent-purple)); }
+.arrow-down.purple::after { color: var(--accent-purple); }
+
+.stage {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 24px 32px;
+  width: 100%;
+  max-width: 1100px;
+  position: relative;
+  transition: border-color 0.3s;
+}
+.stage:hover { border-color: var(--accent-cyan); }
+.stage-label {
+  position: absolute;
+  top: -12px;
+  left: 24px;
+  background: var(--bg);
+  padding: 2px 12px;
+  border-radius: 6px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+}
+.stage-label.cyan { color: var(--accent-cyan); border: 1px solid var(--accent-cyan); }
+.stage-label.green { color: var(--accent-green); border: 1px solid var(--accent-green); }
+.stage-label.amber { color: var(--accent-amber); border: 1px solid var(--accent-amber); }
+.stage-label.red { color: var(--accent-red); border: 1px solid var(--accent-red); }
+.stage-label.purple { color: var(--accent-purple); border: 1px solid var(--accent-purple); }
+.stage-label.blue { color: var(--accent-blue); border: 1px solid var(--accent-blue); }
+
+.stage-title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin-bottom: 12px;
+  margin-top: 8px;
+}
+
+.modules-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+}
+.module-card {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  font-size: 0.82rem;
+  transition: transform 0.2s, border-color 0.3s;
+}
+.module-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent-cyan);
+}
+.module-card .name {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 500;
+  font-size: 0.85rem;
+  margin-bottom: 4px;
+}
+.module-card .desc {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+.module-card .output {
+  margin-top: 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  padding: 4px 8px;
+  background: rgba(6, 182, 212, 0.1);
+  border-radius: 4px;
+  color: var(--accent-cyan);
+}
+.module-card.suspended {
+  opacity: 0.35;
+  border-style: dashed;
+}
+.module-card.suspended .name::after {
+  content: ' [SUSPENDED]';
+  color: var(--accent-red);
+  font-size: 0.65rem;
+}
+.module-card.new-module {
+  border-color: var(--accent-green);
+  border-style: dashed;
+  border-width: 2px;
+}
+.module-card.new-module .name::after {
+  content: ' [NEW]';
+  color: var(--accent-green);
+  font-size: 0.65rem;
+}
+
+.decision-box {
+  background: var(--bg3);
+  border: 2px solid var(--accent-amber);
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-top: 12px;
+  position: relative;
+}
+.decision-box .label {
+  font-size: 0.75rem;
+  color: var(--accent-amber);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 8px;
+}
+.decision-box .logic {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+.decision-box .logic .kw { color: var(--accent-purple); }
+.decision-box .logic .val { color: var(--accent-green); }
+.decision-box .logic .block { color: var(--accent-red); }
+
+.split-row {
+  display: flex;
+  gap: 20px;
+  width: 100%;
+  max-width: 1100px;
+}
+.split-row > .stage { flex: 1; }
+
+.legend {
+  margin-top: 40px;
+  text-align: center;
+  display: flex;
+  gap: 24px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.data-sources {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.data-tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  padding: 4px 10px;
+  border-radius: 20px;
+  border: 1px solid;
+}
+.data-tag.tardis { border-color: var(--accent-cyan); color: var(--accent-cyan); }
+.data-tag.binance { border-color: var(--accent-amber); color: var(--accent-amber); }
+.data-tag.deribit { border-color: var(--accent-purple); color: var(--accent-purple); }
+
+.principle-box {
+  background: rgba(139, 92, 246, 0.08);
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  border-radius: 10px;
+  padding: 16px 20px;
+  margin-top: 12px;
+  font-size: 0.82rem;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.principle-box strong {
+  color: var(--accent-purple);
+}
+
+.position-mgmt {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+.pos-action {
+  background: var(--bg3);
+  border-radius: 8px;
+  padding: 12px 14px;
+  text-align: center;
+  font-size: 0.78rem;
+}
+.pos-action .pos-label {
+  font-weight: 600;
+  font-size: 0.82rem;
+  margin-bottom: 4px;
+}
+.pos-action.tp { border-left: 3px solid var(--accent-green); }
+.pos-action.sl { border-left: 3px solid var(--accent-red); }
+.pos-action.signal { border-left: 3px solid var(--accent-purple); }
+
+.two-col { display: flex; gap: 16px; margin-top: 12px; }
+.two-col > div { flex: 1; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>OBI Pro — Decision Making Architecture</h1>
+  <p class="subtitle">Complete signal-to-trade pipeline with all approved changes (P1–P15)</p>
+
+  <div class="flow">
+
+    <!-- STAGE 1: DATA INGESTION -->
+    <div class="stage">
+      <span class="stage-label cyan">Stage 1</span>
+      <div class="stage-title">Data Ingestion</div>
+      <div class="data-sources">
+        <span class="data-tag tardis">Tardis.dev — OB Depth (book_snapshot_25) + Trades</span>
+        <span class="data-tag binance">Binance — Klines 15min + 4h (for Market Structure)</span>
+        <span class="data-tag deribit">Deribit — Options Chain + DVOL (for GEX regime)</span>
+      </div>
+      <div class="modules-grid" style="margin-top: 14px;">
+        <div class="module-card">
+          <div class="name">Order Book Feed</div>
+          <div class="desc">25-level bid/ask depth, real-time snapshots</div>
+          <div class="output">→ bids[], asks[], mid_price, spread</div>
+        </div>
+        <div class="module-card">
+          <div class="name">Trade Feed</div>
+          <div class="desc">Matched trades with volume + aggressor side</div>
+          <div class="output">→ trades[], buy_vol, sell_vol</div>
+        </div>
+        <div class="module-card">
+          <div class="name">Kline Feed</div>
+          <div class="desc">15min + 4h OHLCV candles from Binance</div>
+          <div class="output">→ candles_15m[], candles_4h[]</div>
+        </div>
+        <div class="module-card">
+          <div class="name">Options Feed</div>
+          <div class="desc">Deribit options chain + DVOL for gamma regime</div>
+          <div class="output">→ options_chain[], dvol, gex</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow-down"></div>
+
+    <!-- STAGE 2: SIGNAL MODULES -->
+    <div class="stage">
+      <span class="stage-label green">Stage 2</span>
+      <div class="stage-title">Signal Modules (Independent, Parallel Processing)</div>
+      <div class="modules-grid">
+        <div class="module-card">
+          <div class="name">M1 — OBI</div>
+          <div class="desc">Order Book Imbalance — bid/ask volume ratio, MA-smoothed</div>
+          <div class="output">→ continuous float [-1.0, +1.0] (P6 fix)</div>
+        </div>
+        <div class="module-card">
+          <div class="name">M2 — VPIN</div>
+          <div class="desc">Volume-Sync Probability of Informed Trading</div>
+          <div class="output">→ vpin_value (0-1), dynamic bucket (P2 fix)</div>
+        </div>
+        <div class="module-card">
+          <div class="name">M3 — Spread Monitor</div>
+          <div class="desc">MM engagement level — confidence multiplier (not directional)</div>
+          <div class="output">→ multiplier: 1.0 / 0.7 / 0.3 / VETO (P4 fix)</div>
+        </div>
+        <div class="module-card">
+          <div class="name">M4 — Depth Erosion</div>
+          <div class="desc">Bid/ask depth change over time window</div>
+          <div class="output">→ score {-1, 0, +1}</div>
+        </div>
+        <div class="module-card">
+          <div class="name">M5 — Spoofing Detector</div>
+          <div class="desc">Large order cancellation detection (live only, backtest = 0)</div>
+          <div class="output">→ score {-1, 0, +1} (P11: 0 in backtest)</div>
+        </div>
+        <div class="module-card">
+          <div class="name">M6 — Clearance Detector</div>
+          <div class="desc">All 4 traces required + raised thresholds</div>
+          <div class="output">→ ACTIVE (4/4) / POSSIBLE (3/4) (P8 fix)</div>
+        </div>
+        <div class="module-card">
+          <div class="name">M7 — Options Layer</div>
+          <div class="desc">GEX regime from Deribit data / DVOL proxy</div>
+          <div class="output">→ regime, multiplier (P5 fix: real data)</div>
+        </div>
+        <div class="module-card suspended">
+          <div class="name">PA Filter</div>
+          <div class="desc">EMA crossover, candlestick patterns — indicator-only</div>
+          <div class="output">→ NOT CALLED (replaced by Market Structure)</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow-down green"></div>
+
+    <!-- STAGE 3: VETO CHECK (Entry Gate) -->
+    <div class="stage" style="border-color: var(--accent-red);">
+      <span class="stage-label red">Stage 3</span>
+      <div class="stage-title">VETO Gate — Entry Blocker Only (P1 Fix)</div>
+      <div class="principle-box">
+        <strong>KEY RULE:</strong> VETO only blocks NEW position entries. It NEVER touches open positions.
+        Open positions are managed by Stop Loss and Signal Module output only.
+      </div>
+      <div class="decision-box" style="border-color: var(--accent-red);">
+        <div class="label" style="color: var(--accent-red);">Veto Check Logic</div>
+        <div class="logic">
+          <span class="kw">if</span> VPIN > 0.90 <span class="kw">AND</span> sustained for N ticks → <span class="block">BLOCK new entries</span> (with confirmation)<br>
+          <span class="kw">if</span> Spread = MM_WITHDRAWN → <span class="block">BLOCK new entries</span><br>
+          <span class="kw">if</span> Clearance = ACTIVE (4/4 traces) → <span class="block">BLOCK new entries</span><br>
+          <span class="kw">else</span> → <span class="val">PASS (proceed to CE)</span><br>
+          <br>
+          <em style="color: var(--text-dim); font-size: 0.72rem;">No force_close_all(). Existing positions untouched. SL is the safety net.</em>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow-down green"></div>
+
+    <!-- STAGE 4: CONFIRMATION ENGINE -->
+    <div class="stage" style="border-color: var(--accent-amber);">
+      <span class="stage-label amber">Stage 4</span>
+      <div class="stage-title">Confirmation Engine (CE) — Weighted Score Aggregation</div>
+      <div class="two-col">
+        <div>
+          <div class="decision-box">
+            <div class="label">Weighted Score Calculation</div>
+            <div class="logic">
+              <span class="kw">score =</span><br>
+              &nbsp;&nbsp;OBI_continuous × <span class="val">0.26</span><br>
+              &nbsp;&nbsp;+ Depth × <span class="val">0.26</span><br>
+              &nbsp;&nbsp;+ Clearance × <span class="val">0.24</span><br>
+              &nbsp;&nbsp;+ Options × <span class="val">0.24</span><br>
+              <br>
+              <em style="color: var(--text-dim);">(Spoof = 0 in backtest, weight redistributed)</em><br>
+              <em style="color: var(--text-dim);">(Spread removed from score — now multiplier)</em>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="decision-box">
+            <div class="label">Modifiers Applied</div>
+            <div class="logic">
+              1. <span class="kw">Spread multiplier:</span> score × <span class="val">spread_mult</span><br>
+              &nbsp;&nbsp;&nbsp;MM_ACTIVE → ×1.0<br>
+              &nbsp;&nbsp;&nbsp;MM_CAUTIOUS → ×0.7<br>
+              &nbsp;&nbsp;&nbsp;MM_THINNING → ×0.3<br>
+              <br>
+              2. <span class="kw">Options regime:</span> score × <span class="val">regime_mult</span><br>
+              &nbsp;&nbsp;&nbsp;LONG_GAMMA → ×0.85<br>
+              &nbsp;&nbsp;&nbsp;NEUTRAL → ×1.0<br>
+              &nbsp;&nbsp;&nbsp;SHORT_GAMMA → ×1.20
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="decision-box" style="margin-top: 12px;">
+        <div class="label">CE Output</div>
+        <div class="logic">
+          <span class="kw">if</span> final_score ≥ threshold → <span class="val">LONG signal</span><br>
+          <span class="kw">if</span> final_score ≤ -threshold → <span class="val">SHORT signal</span><br>
+          <span class="kw">else</span> → NEUTRAL (no action)
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow-down amber"></div>
+
+    <!-- STAGE 5: MARKET STRUCTURE (Final Gate) -->
+    <div class="stage" style="border-color: var(--accent-green);">
+      <span class="stage-label green">Stage 5 — Final Gate</span>
+      <div class="stage-title">Market Structure Reader (Replaces PA Filter)</div>
+      <div class="modules-grid">
+        <div class="module-card new-module">
+          <div class="name">Swing Point Detection</div>
+          <div class="desc">Fractal pivots — swing highs and swing lows identification</div>
+          <div class="output">→ swing_highs[], swing_lows[]</div>
+        </div>
+        <div class="module-card new-module">
+          <div class="name">BOS Detection</div>
+          <div class="desc">Break of Structure — trend continuation confirmed</div>
+          <div class="output">→ bullish_bos / bearish_bos</div>
+        </div>
+        <div class="module-card new-module">
+          <div class="name">CHoCH Detection</div>
+          <div class="desc">Change of Character — trend reversal early warning</div>
+          <div class="output">→ bullish_choch / bearish_choch</div>
+        </div>
+        <div class="module-card new-module">
+          <div class="name">Trend Classification</div>
+          <div class="desc">HH/HL = bullish, LH/LL = bearish, else = range</div>
+          <div class="output">→ BULLISH / BEARISH / RANGE</div>
+        </div>
+      </div>
+      <div class="principle-box" style="border-color: rgba(16, 185, 129, 0.3); background: rgba(16, 185, 129, 0.06);">
+        <strong style="color: var(--accent-green);">Multi-timeframe:</strong> Analyzes both 15min and 4h candles simultaneously.
+        Uses Binance kline data (free, no API key required).
+      </div>
+      <div class="decision-box" style="border-color: var(--accent-green);">
+        <div class="label" style="color: var(--accent-green);">Structure Gate Logic</div>
+        <div class="logic">
+          <span class="kw">if</span> CE = LONG <span class="kw">AND</span> structure = BULLISH or RANGE → <span class="val">ALLOW</span><br>
+          <span class="kw">if</span> CE = LONG <span class="kw">AND</span> structure = BEARISH → <span class="block">BLOCK (counter-trend)</span><br>
+          <span class="kw">if</span> CE = SHORT <span class="kw">AND</span> structure = BEARISH or RANGE → <span class="val">ALLOW</span><br>
+          <span class="kw">if</span> CE = SHORT <span class="kw">AND</span> structure = BULLISH → <span class="block">BLOCK (counter-trend)</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow-down green"></div>
+
+    <!-- STAGE 6: POSITION MANAGEMENT -->
+    <div class="stage" style="border-color: var(--accent-blue);">
+      <span class="stage-label blue">Stage 6</span>
+      <div class="stage-title">Position Execution & Management</div>
+      <div class="position-mgmt">
+        <div class="pos-action tp">
+          <div class="pos-label" style="color: var(--accent-green);">Take Profit</div>
+          TP1: 50% @ 2.0R (maker order)<br>
+          TP2: 30% @ S/R level (Market Structure)<br>
+          TP3: 20% trailing stop (ATR-based)
+        </div>
+        <div class="pos-action sl">
+          <div class="pos-label" style="color: var(--accent-red);">Stop Loss</div>
+          ATR-based from 15min candles<br>
+          min_stop = 0.5% of price<br>
+          <strong>Primary safety net (not VETO)</strong>
+        </div>
+        <div class="pos-action signal">
+          <div class="pos-label" style="color: var(--accent-purple);">Signal Exit</div>
+          Signal Modules flip direction →<br>
+          close existing position<br>
+          <strong>Only way to force-close</strong>
+        </div>
+      </div>
+      <div class="principle-box" style="border-color: rgba(59, 130, 246, 0.3); background: rgba(59, 130, 246, 0.06); margin-top: 12px;">
+        <strong style="color: var(--accent-blue);">Position rules:</strong>
+        Maker orders (0.02% fee) preferred over taker (0.10%).
+        Cooldown between trades. Daily trade cap enforced. Quality > quantity.
+      </div>
+    </div>
+
+  </div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background: var(--accent-cyan);"></div> Data / Input</div>
+    <div class="legend-item"><div class="legend-dot" style="background: var(--accent-green);"></div> Signal / Allow</div>
+    <div class="legend-item"><div class="legend-dot" style="background: var(--accent-amber);"></div> Aggregation / CE</div>
+    <div class="legend-item"><div class="legend-dot" style="background: var(--accent-red);"></div> Veto / Block</div>
+    <div class="legend-item"><div class="legend-dot" style="background: var(--accent-purple);"></div> Modifier / Exit</div>
+    <div class="legend-item"><div class="legend-dot" style="background: var(--accent-blue);"></div> Execution</div>
+    <div class="legend-item" style="opacity: 0.4;"><div class="legend-dot" style="background: var(--text-dim); border: 1px dashed var(--text-dim);"></div> Suspended</div>
+    <div class="legend-item"><div class="legend-dot" style="background: transparent; border: 2px dashed var(--accent-green);"></div> New Module</div>
+  </div>
+
+  <div style="margin-top: 50px; padding: 24px; background: var(--bg2); border-radius: 16px; border: 1px solid var(--border);">
+    <div style="font-size: 1rem; font-weight: 600; margin-bottom: 16px; color: var(--accent-cyan);">Full Signal Flow Summary</div>
+    <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; line-height: 2; color: var(--text-dim);">
+      <span style="color: var(--accent-cyan);">① DATA IN</span> → Tardis OB + Binance Klines + Deribit Options<br>
+      <span style="color: var(--accent-green);">② SIGNALS</span> → 7 modules process data independently → each produces a score<br>
+      <span style="color: var(--accent-red);">③ VETO</span> → Check VPIN / Spread / Clearance → if ANY fires → <strong style="color: var(--accent-red);">BLOCK new entries only</strong> (existing positions untouched)<br>
+      <span style="color: var(--accent-amber);">④ CE</span> → Weighted score aggregation → Spread multiplier → Options regime multiplier → LONG / SHORT / NEUTRAL<br>
+      <span style="color: var(--accent-green);">⑤ STRUCTURE</span> → Market Structure (CHoCH, BOS, swing) confirms direction → ALLOW or BLOCK<br>
+      <span style="color: var(--accent-blue);">⑥ EXECUTE</span> → Open position → managed by SL / TP / Signal flip only
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
