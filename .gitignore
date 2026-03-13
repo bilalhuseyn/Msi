@@ -26,3 +26,9 @@ htmlcov/
 *.swp
 *.swo
 *~
+
+# Large data files
+historical_data/
+
+# Reports (optional - tracked separately)
+# reports/

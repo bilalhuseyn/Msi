@@ -1,0 +1,25 @@
+{
+  "backtest": {
+    "total_ticks": 2874,
+    "initial_balance": 10000.0,
+    "final_balance": 10000.0,
+    "veto_count": 1524,
+    "signal_count": 0
+  },
+  "metrics": {
+    "total_trades": 0,
+    "win_rate": 0.0,
+    "net_pnl": 0.0,
+    "profit_factor": 0.0,
+    "sharpe_ratio": 0.0,
+    "sortino_ratio": 0.0,
+    "calmar_ratio": 0.0,
+    "max_drawdown_pct": 0.0,
+    "avg_rr": 0.0,
+    "return_pct": 0.0,
+    "total_fees": 0.0,
+    "avg_daily_trades": 0.0,
+    "veto_count": 1524
+  },
+  "params": {}
+}
