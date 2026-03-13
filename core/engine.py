@@ -7,10 +7,14 @@ and risk management.  Phase 0+1+2+3 implementation.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import signal
 import time
 from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
 
 from config.settings import Settings, get_settings
 from config.constants import (
@@ -52,6 +56,7 @@ class OFIEngine:
         settings: Settings | None = None,
         paper_trading: bool = True,
         initial_balance: float = 10_000.0,
+        paper_log_file: str | None = None,
     ):
         self.settings = settings or get_settings()
         self.event_bus = EventBus()
@@ -78,6 +83,10 @@ class OFIEngine:
         # Paper trader — active when paper_trading=True (default)
         self._paper: PaperTrader | None = (
             PaperTrader(initial_balance=initial_balance) if paper_trading else None
+        )
+        self._paper_log_file: str = (
+            paper_log_file
+            or os.environ.get("PAPER_LOG_FILE", "logs/paper_trades.jsonl")
         )
 
         self._last_ob: dict[str, dict] = {}
@@ -164,6 +173,9 @@ class OFIEngine:
             await self._influx.stop()
         if self._sqlite:
             await self._sqlite.stop()
+
+        if self._paper is not None:
+            self._flush_paper_log()
 
         logger.info("OFI Pro Engine stopped")
 
@@ -423,6 +435,57 @@ class OFIEngine:
             "score": decision.score,
             "action": float(decision.direction),
         })
+
+    # ---- Paper Trade Logging ----
+
+    def _flush_paper_log(self) -> None:
+        """Write PaperTrader session summary + trade list to JSONL log file."""
+        if self._paper is None:
+            return
+        try:
+            log_path = Path(self._paper_log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            stats = self._paper._stats
+            positions = list(self._paper._closed_positions)
+
+            session_record = {
+                "session_end": datetime.now(timezone.utc).isoformat(),
+                "summary": {
+                    "total_trades": stats.total_trades,
+                    "wins": stats.wins,
+                    "losses": stats.losses,
+                    "win_rate": round(stats.win_rate, 4),
+                    "total_pnl": round(stats.total_pnl, 4),
+                    "max_drawdown": round(stats.max_drawdown, 4),
+                    "profit_factor": round(stats.profit_factor, 4),
+                    "vetoes": stats.vetoes,
+                },
+                "trades": [
+                    {
+                        "symbol": p.symbol,
+                        "side": p.side,
+                        "entry_price": p.entry_price,
+                        "exit_price": p.exit_price,
+                        "qty": p.qty,
+                        "pnl": round(p.pnl, 4),
+                        "state": p.state.value if hasattr(p.state, "value") else str(p.state),
+                        "open_ts": p.open_ts,
+                        "close_ts": p.close_ts,
+                    }
+                    for p in positions
+                ],
+            }
+
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(session_record) + "\n")
+
+            logger.info(
+                "Paper trade log written → %s  (%d trades, PnL=%.2f)",
+                log_path, stats.total_trades, stats.total_pnl,
+            )
+        except Exception as exc:
+            logger.warning("Failed to write paper trade log: %s", exc)
 
     # ---- Helpers ----
 

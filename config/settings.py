@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import functools
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -172,9 +172,19 @@ class BinanceSettings(BaseSettings):
 
 
 class BybitSettings(BaseSettings):
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+    testnet: bool = Field(False, alias="BYBIT_TESTNET")
     ws_base_url: str = "wss://stream.bybit.com/v5/public/linear"
     rest_base_url: str = "https://api.bybit.com"
     orderbook_depth: int = 200
+
+    @model_validator(mode="after")
+    def _apply_testnet_urls(self) -> "BybitSettings":
+        if self.testnet:
+            self.ws_base_url = "wss://stream-testnet.bybit.com/v5/public/linear"
+            self.rest_base_url = "https://api-testnet.bybit.com"
+        return self
 
 
 class DeribitSettings(BaseSettings):
