@@ -1,0 +1,49 @@
+============================================================
+  OFI Pro — Backtest Performance Report
+============================================================
+
+  Period:     2874 ticks processed
+  Balance:    $10,000.00 -> $9,947.77
+  Return:     -0.36%
+
+--- Trade Statistics ---
+  Total Trades:      16
+  Winners:           0 (0.0%)
+  Losers:            16
+  Long / Short:      4 / 12
+  Veto Events:       1270
+  Avg Daily Trades:  14.5
+
+--- P&L Breakdown ---
+  Net P&L:           $-36.23
+  Gross Profit:      $0.00
+  Gross Loss:        $36.23
+  Total Fees:        $32.00
+  Largest Win:       $-0.87
+  Largest Loss:      $-4.56
+
+--- Risk Metrics ---
+  Max Drawdown:      0.52% ($52.29)
+  Sharpe Ratio:      -57.783
+  Sortino Ratio:     -15.583
+  Calmar Ratio:      -229.208
+  Profit Factor:     0.000
+  Avg Win/Loss:      0.00
+  Avg Hold Time:     7 min
+
+--- PRD Target Check ---
+  [FAIL] win_rate_target
+  [FAIL] win_rate_min
+  [FAIL] rr_target
+  [FAIL] rr_min
+  [FAIL] sharpe_target
+  [FAIL] sharpe_min
+  [PASS] max_dd_target
+  [PASS] max_dd_min
+  [FAIL] profit_factor_target
+  [FAIL] profit_factor_min
+  [FAIL] daily_trades_ok
+  [PASS] daily_limit_respected
+
+
+============================================================
