@@ -81,6 +81,7 @@ class BacktestSettings(BaseSettings):
     max_stop_risk_pct: float = Field(0.015)
     cooldown_seconds: int = Field(900)
     options_regime: str = Field("NEUTRAL")  # LONG_GAMMA | SHORT_GAMMA | NEUTRAL
+    sample_interval_sec: int = Field(1)  # P14: seconds between ticks; >1 triggers window auto-scaling
 
 
 class MomentumSettings(BaseSettings):

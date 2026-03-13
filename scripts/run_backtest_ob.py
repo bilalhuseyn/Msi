@@ -28,7 +28,7 @@ from signals.market_structure import build_candles_from_trades
 logger = logging.getLogger(__name__)
 
 
-def _real_ob_settings():
+def _real_ob_settings(sample_every: int = 100):
     """
     Settings calibrated for real order book data (Tardis book_snapshot_25).
 
@@ -43,6 +43,8 @@ def _real_ob_settings():
     - taker_fee_pct=0.0002: maker orders (0.02%) vs taker (0.1%)
     - slippage_pct=0.0001: limit orders have near-zero slippage
     - tp1_rr=2.0: first target at 2R (was 1.5R) to improve avg win/loss
+
+    P14: sample_interval_sec passed so BacktestEngine auto-scales time windows.
     """
     vpin = VPINSettings(
         bucket_size=500.0,
@@ -63,9 +65,10 @@ def _real_ob_settings():
     )
     bt = BacktestSettings(
         cooldown_seconds=600,
-        taker_fee_pct=0.0002,   # P15: maker orders (0.02% vs 0.1% taker)
-        slippage_pct=0.0001,    # P15: limit order slippage near-zero
-        tp1_rr=2.0,             # P15: 2R first target (was 1.5R)
+        taker_fee_pct=0.0002,        # P15: maker orders (0.02% vs 0.1% taker)
+        slippage_pct=0.0001,         # P15: limit order slippage near-zero
+        tp1_rr=2.0,                  # P15: 2R first target (was 1.5R)
+        sample_interval_sec=sample_every,  # P14: enables window auto-scaling
     )
     return obi, vpin, ce, bt
 
@@ -112,7 +115,7 @@ def run(
     avg_trades = sum(len(t.trades) for t in ticks[:1000]) / min(len(ticks), 1000)
     logger.info("Avg OB depth: %.1f levels | Avg trades/tick: %.1f", avg_depth, avg_trades)
 
-    obi_s, vpin_s, ce_s, bt_s = _real_ob_settings()
+    obi_s, vpin_s, ce_s, bt_s = _real_ob_settings(sample_every)
     engine = BacktestEngine(
         obi_settings=obi_s,
         vpin_settings=vpin_s,

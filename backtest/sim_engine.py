@@ -84,9 +84,36 @@ class BacktestEngine:
         bt = backtest_settings or BacktestSettings()
         self._bt = bt
 
-        self._obi = OBIModule(obi_settings)
+        # P14: auto-scale time-based windows when ticks are sub-sampled.
+        # At sample_interval_sec=100 (every 100th snapshot ≈ 100s per tick):
+        #   spread baseline: 1440 → 864 samples  (24h of real data)
+        #   OBI MA:          10   → 6   samples  (~10 min of real data)
+        #   clearance depth: 5   → 3   samples  (~5 min lookback)
+        si = bt.sample_interval_sec
+        if si > 1:
+            _obi_s = (obi_settings or OBISettings()).model_copy(
+                update={"ma_window": max(5, 600 // si)}
+            )
+            _spread_s = (spread_settings or SpreadSettings()).model_copy(
+                update={"baseline_window": max(10, 86400 // si)}
+            )
+            _cl_ob_depth = max(3, 300 // si)
+            logger.info(
+                "P14 window scaling (sample_interval=%ds): "
+                "obi_ma=%d spread_baseline=%d cl_ob_depth=%d",
+                si,
+                _obi_s.ma_window,
+                _spread_s.baseline_window,
+                _cl_ob_depth,
+            )
+        else:
+            _obi_s = obi_settings
+            _spread_s = spread_settings
+            _cl_ob_depth = (clearance_settings or ClearanceSettings()).ob_history_depth
+
+        self._obi = OBIModule(_obi_s)
         self._vpin = VPINModule(vpin_settings)
-        self._spread = SpreadMonitor(spread_settings)
+        self._spread = SpreadMonitor(_spread_s)
         self._options = OptionsLayer(options_settings)
 
         de_cfg = depth_settings or DepthErosionSettings()
@@ -110,7 +137,7 @@ class BacktestEngine:
             large_trade_multiplier=cl_cfg.large_trade_multiplier,
             large_trade_min_cluster=cl_cfg.large_trade_min_cluster,
             bid_thin_pct=cl_cfg.bid_thin_pct,
-            ob_history_depth=cl_cfg.ob_history_depth,
+            ob_history_depth=_cl_ob_depth,  # P14: scaled
             recent_trade_window=cl_cfg.recent_trade_window,
         )
 
