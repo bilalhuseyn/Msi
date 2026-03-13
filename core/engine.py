@@ -156,7 +156,7 @@ class OFIEngine:
 
         self._running = True
         logger.info(
-            "OFI Pro Engine started — %d symbols, %d feeds, 7 modules + CE",
+            "OFI Pro Engine started | %d symbols, %d feeds, 7 modules + CE",
             len(s.symbols), len(self._feeds) + 1,
         )
 
@@ -185,7 +185,13 @@ class OFIEngine:
         event = self.normalizer.normalize_order_book(event)
         data = event["data"]
         symbol = data["symbol"]
-        if data["exchange"] != "binance":
+        exchange = data["exchange"]
+
+        # Track health for all exchanges
+        if exchange == "bybit" and symbol in self._obi:
+            self.health.update(f"bybit-{symbol}", "connected")
+
+        if exchange != "binance":
             return
 
         self._last_ob[symbol] = data

@@ -31,7 +31,10 @@ class BinanceFeed(BaseFeed):
             f"{sym}@aggTrade",
             f"{sym}@bookTicker",
         ]
-        url = f"{cfg.ws_base_url}/{'/'.join(streams)}"
+        # Binance combined stream endpoint — returns {"stream": "...", "data": {...}}
+        # Must use /stream?streams= (not /ws/s1/s2) for multi-stream wrapper format
+        base = cfg.ws_base_url.replace("/ws", "")
+        url = f"{base}/stream?streams={'/'.join(streams)}"
         super().__init__(name=f"binance-{symbol}", url=url, event_bus=event_bus)
         self.symbol = symbol.upper()
 

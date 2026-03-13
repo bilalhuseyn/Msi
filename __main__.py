@@ -74,7 +74,7 @@ async def _run(args: argparse.Namespace) -> None:
     if args.testnet:
         os.environ["BYBIT_TESTNET"] = "true"
         logging.getLogger(__name__).info(
-            "⚠️  TESTNET MODE — connecting to stream-testnet.bybit.com"
+            "[TESTNET] Connecting to stream-testnet.bybit.com"
         )
 
     settings = Settings()
