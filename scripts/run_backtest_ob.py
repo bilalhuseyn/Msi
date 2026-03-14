@@ -8,6 +8,7 @@ Usage:
     python scripts/run_backtest_ob.py
     python scripts/run_backtest_ob.py --data-dir historical_data/tardis/binance-futures --sample 200
     python scripts/run_backtest_ob.py --limit 50000 --output reports/real_ob_result
+    python scripts/run_backtest_ob.py --klines-dir historical_data/BTCUSDT/klines/15m --output reports/real_ob_klines
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from backtest.report import BacktestReport
 from config.settings import (
     BacktestSettings, VPINSettings, ConfirmationSettings, OBISettings,
 )
-from data.converter import tardis_ob_to_ticks, _load_tardis_trades
+from data.converter import tardis_ob_to_ticks, _load_tardis_trades, load_klines_as_candles
 from signals.market_structure import build_candles_from_trades
 
 logger = logging.getLogger(__name__)
@@ -78,15 +79,23 @@ def run(
     sample_every: int,
     limit: int | None,
     output: str | None,
+    klines_dir: str | None = None,
 ) -> BacktestResult:
     data_path = Path(data_dir)
 
-    logger.info("Building 15-min candles from Tardis trade data...")
+    logger.info("Loading Tardis trade data...")
     t0 = time.time()
     trade_files = sorted(data_path.glob("*trades*.csv.gz"))
     trades_by_sec = _load_tardis_trades(trade_files)
-    candles_15m = build_candles_from_trades(trades_by_sec, interval_sec=900)
-    logger.info("Built %d candles (15-min) in %.1fs", len(candles_15m), time.time() - t0)
+
+    if klines_dir:
+        logger.info("Building 15-min candles from Binance klines: %s", klines_dir)
+        candles_15m = load_klines_as_candles(klines_dir, target_interval_sec=900)
+        logger.info("Loaded %d continuous candles (15-min) in %.1fs", len(candles_15m), time.time() - t0)
+    else:
+        logger.info("Building 15-min candles from Tardis trade data (12 isolated days)...")
+        candles_15m = build_candles_from_trades(trades_by_sec, interval_sec=900)
+        logger.info("Built %d candles (15-min) in %.1fs", len(candles_15m), time.time() - t0)
 
     logger.info("Loading real OB data from %s (sample_every=%d)", data_dir, sample_every)
     t0 = time.time()
@@ -159,6 +168,12 @@ def main():
     )
     parser.add_argument("--limit", type=int, default=None, help="Max ticks to load")
     parser.add_argument("--output", default="reports/real_ob_backtest", help="Output path")
+    parser.add_argument(
+        "--klines-dir",
+        default=None,
+        help="Directory with 15m kline CSVs for continuous candles (recommended). "
+             "If omitted, candles are built from Tardis trade data (12 isolated days only).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -166,7 +181,7 @@ def main():
         format="%(asctime)s %(levelname)-8s %(message)s",
     )
 
-    run(args.data_dir, args.sample, args.limit, args.output)
+    run(args.data_dir, args.sample, args.limit, args.output, args.klines_dir)
 
 
 if __name__ == "__main__":
