@@ -188,14 +188,22 @@ class OFIEngine:
         exchange = data["exchange"]
 
         # Track health for all exchanges
-        if exchange == "bybit" and symbol in self._obi:
+        if exchange == "bybit":
             self.health.update(f"bybit-{symbol}", "connected")
+        elif exchange == "binance":
+            self.health.update(f"binance-{symbol}", "connected")
 
-        if exchange != "binance":
-            return
+        # Use Bybit as primary when available, fallback to Binance
+        # On VPS, Binance may not stream continuously; Bybit testnet is reliable
+        preferred = "bybit" if self.settings.bybit.testnet else "binance"
+        if exchange != preferred:
+            # Accept the other exchange only if preferred hasn't sent data recently
+            last = self._last_ob.get(symbol, {})
+            last_exchange = last.get("exchange", "")
+            if last_exchange == preferred:
+                return  # preferred exchange data is fresh, skip fallback
 
         self._last_ob[symbol] = data
-        self.health.update(f"binance-{symbol}", "connected")
 
         obi_result = self._obi[symbol].update(data) if symbol in self._obi else None
 
