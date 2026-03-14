@@ -418,6 +418,124 @@ def tardis_ob_to_ticks(
     return ticks
 
 
+def recorded_ob_to_ticks(
+    recorded_dir: str | Path,
+    *,
+    depth: int = 20,
+    sample_every: int = 10,
+    limit: int | None = None,
+) -> list[BacktestTick]:
+    """
+    Convert DataRecorder output (depth20@100ms) to BacktestTick list.
+
+    Reads orderbook_*.csv and trades_*.csv files produced by record_data.py,
+    including files nested in daily sub-directories ({recorded_dir}/{YYYY-MM-DD}/).
+
+    Args:
+        recorded_dir: root directory of DataRecorder output
+        depth: number of OB levels to use (max 20)
+        sample_every: take every Nth OB snapshot (10 = ~1 tick/sec at 100ms feed)
+        limit: total ticks cap
+    """
+    recorded_dir = Path(recorded_dir)
+    depth = min(depth, 20)
+
+    # ── Build trades_by_sec from all recorder trade files ───────────────────
+    trade_files = sorted(recorded_dir.rglob("trades_*.csv"))
+    trades_by_sec: dict[int, list[dict]] = {}
+
+    for tf in trade_files:
+        with open(tf, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    raw_ts = row.get("timestamp_ms") or row.get("timestamp") or "0"
+                    ts_raw = float(raw_ts)
+                    ts_sec = ts_raw / 1000.0 if ts_raw > 1e12 else ts_raw
+                    sec_key = int(ts_sec)
+                    trades_by_sec.setdefault(sec_key, []).append({
+                        "price": float(row["price"]),
+                        "qty": float(row["qty"]),
+                        "side": row.get("side", "unknown").strip().lower(),
+                        "timestamp": ts_sec,
+                    })
+                except (ValueError, KeyError):
+                    continue
+
+    logger.info(
+        "Recorder trades: %d files, %d seconds indexed",
+        len(trade_files), len(trades_by_sec),
+    )
+
+    # ── Load sampled OB snapshots ────────────────────────────────────────────
+    ob_files = sorted(recorded_dir.rglob("orderbook_*.csv"))
+    ticks: list[BacktestTick] = []
+    total_rows = 0
+
+    for ob_file in ob_files:
+        with open(ob_file, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                total_rows += 1
+                if total_rows % sample_every != 0:
+                    continue
+
+                try:
+                    raw_ts = row.get("timestamp_ms") or row.get("timestamp") or "0"
+                    ts_raw = float(raw_ts)
+                    ts_sec = ts_raw / 1000.0 if ts_raw > 1e12 else ts_raw
+                except (ValueError, TypeError):
+                    continue
+
+                bids, asks = [], []
+                for j in range(1, depth + 1):
+                    try:
+                        bp, bq = float(row.get(f"bid{j}_price", 0)), float(row.get(f"bid{j}_qty", 0))
+                        ap, aq = float(row.get(f"ask{j}_price", 0)), float(row.get(f"ask{j}_qty", 0))
+                        if bp > 0:
+                            bids.append({"price": bp, "qty": bq})
+                        if ap > 0:
+                            asks.append({"price": ap, "qty": aq})
+                    except ValueError:
+                        pass
+
+                if len(bids) < 3 or len(asks) < 3:
+                    continue
+
+                sec_key = int(ts_sec)
+                ticks.append(BacktestTick(
+                    timestamp=ts_sec,
+                    bids=bids,
+                    asks=asks,
+                    trades=trades_by_sec.get(sec_key, []),
+                    best_bid=bids[0]["price"],
+                    best_ask=asks[0]["price"],
+                ))
+
+                if limit and len(ticks) >= limit:
+                    break
+
+        if limit and len(ticks) >= limit:
+            break
+
+    ticks.sort(key=lambda t: t.timestamp)
+
+    logger.info(
+        "Recorded OB -> %d ticks (from %d rows, sample_every=%d)",
+        len(ticks), total_rows, sample_every,
+    )
+    if ticks:
+        span_h = (ticks[-1].timestamp - ticks[0].timestamp) / 3600
+        logger.info(
+            "Time span: %.1f hours | Price range: %.2f - %.2f",
+            span_h,
+            min(t.mid_price for t in ticks),
+            max(t.mid_price for t in ticks),
+        )
+
+    return ticks
+
+
 def _load_tardis_trades(trade_files: list[Path]) -> dict[int, list[dict]]:
     """Load Tardis trade CSVs and index by second for fast lookup."""
     trades_by_sec: dict[int, list[dict]] = {}

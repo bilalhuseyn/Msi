@@ -1,5 +1,5 @@
 """
-Run backtest on REAL order book depth data from Tardis.dev.
+Run backtest on REAL order book depth data from Tardis.dev or live recorder.
 
 Unlike run_backtest.py (trades-only, synthetic OB), this uses actual
 25-level order book snapshots -- no synthetic books needed.
@@ -9,6 +9,9 @@ Usage:
     python scripts/run_backtest_ob.py --data-dir historical_data/tardis/binance-futures --sample 200
     python scripts/run_backtest_ob.py --limit 50000 --output reports/real_ob_result
     python scripts/run_backtest_ob.py --klines-dir historical_data/BTCUSDT/klines/15m --output reports/real_ob_klines
+
+    # Using live-recorded OB data (after running record_data.py for 1+ week):
+    python scripts/run_backtest_ob.py --recorded-dir recorded_data --klines-dir historical_data/BTCUSDT/klines/15m
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ from backtest.report import BacktestReport
 from config.settings import (
     BacktestSettings, VPINSettings, ConfirmationSettings, OBISettings,
 )
-from data.converter import tardis_ob_to_ticks, _load_tardis_trades, load_klines_as_candles
+from data.converter import tardis_ob_to_ticks, _load_tardis_trades, load_klines_as_candles, recorded_ob_to_ticks
 from signals.market_structure import build_candles_from_trades
 
 logger = logging.getLogger(__name__)
@@ -80,34 +83,48 @@ def run(
     limit: int | None,
     output: str | None,
     klines_dir: str | None = None,
+    recorded_dir: str | None = None,
 ) -> BacktestResult:
-    data_path = Path(data_dir)
-
-    logger.info("Loading Tardis trade data...")
     t0 = time.time()
-    trade_files = sorted(data_path.glob("*trades*.csv.gz"))
-    trades_by_sec = _load_tardis_trades(trade_files)
 
+    # ── Candles (always from Binance klines when provided) ──────────────────
     if klines_dir:
         logger.info("Building 15-min candles from Binance klines: %s", klines_dir)
         candles_15m = load_klines_as_candles(klines_dir, target_interval_sec=900)
-        logger.info("Loaded %d continuous candles (15-min) in %.1fs", len(candles_15m), time.time() - t0)
+        logger.info("Loaded %d continuous candles in %.1fs", len(candles_15m), time.time() - t0)
     else:
-        logger.info("Building 15-min candles from Tardis trade data (12 isolated days)...")
-        candles_15m = build_candles_from_trades(trades_by_sec, interval_sec=900)
-        logger.info("Built %d candles (15-min) in %.1fs", len(candles_15m), time.time() - t0)
+        logger.info("No --klines-dir provided — building candles from Tardis trades (12 isolated days)...")
+        data_path = Path(data_dir)
+        trade_files = sorted(data_path.glob("*trades*.csv.gz"))
+        _trades_for_candles = _load_tardis_trades(trade_files)
+        candles_15m = build_candles_from_trades(_trades_for_candles, interval_sec=900)
+        logger.info("Built %d candles in %.1fs", len(candles_15m), time.time() - t0)
 
-    logger.info("Loading real OB data from %s (sample_every=%d)", data_dir, sample_every)
-    t0 = time.time()
-    ticks = tardis_ob_to_ticks(
-        data_dir,
-        depth=20,
-        sample_every=sample_every,
-        limit=limit,
-        trades_by_sec=trades_by_sec,  # reuse already-loaded index — no double load
-    )
-    load_time = time.time() - t0
-    logger.info("Loaded %d ticks in %.1fs", len(ticks), load_time)
+    # ── OB ticks: recorded data OR Tardis ───────────────────────────────────
+    if recorded_dir:
+        logger.info("Loading LIVE-RECORDED OB data from %s (sample_every=%d)", recorded_dir, sample_every)
+        t1 = time.time()
+        ticks = recorded_ob_to_ticks(
+            recorded_dir,
+            depth=20,
+            sample_every=sample_every,
+            limit=limit,
+        )
+        logger.info("Loaded %d recorded ticks in %.1fs", len(ticks), time.time() - t1)
+    else:
+        logger.info("Loading Tardis OB data from %s (sample_every=%d)", data_dir, sample_every)
+        data_path = Path(data_dir)
+        t1 = time.time()
+        trade_files = sorted(data_path.glob("*trades*.csv.gz"))
+        trades_by_sec = _load_tardis_trades(trade_files)
+        ticks = tardis_ob_to_ticks(
+            data_dir,
+            depth=20,
+            sample_every=sample_every,
+            limit=limit,
+            trades_by_sec=trades_by_sec,  # no double load
+        )
+        logger.info("Loaded %d Tardis ticks in %.1fs", len(ticks), time.time() - t1)
 
     if not ticks:
         logger.error("No ticks generated -- check data directory: %s", data_dir)
@@ -174,6 +191,13 @@ def main():
         help="Directory with 15m kline CSVs for continuous candles (recommended). "
              "If omitted, candles are built from Tardis trade data (12 isolated days only).",
     )
+    parser.add_argument(
+        "--recorded-dir",
+        default=None,
+        help="Directory of live-recorded OB data from record_data.py. "
+             "When provided, --data-dir (Tardis) is ignored for OB ticks. "
+             "Use --klines-dir together with this for proper candle warm-up.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -181,7 +205,7 @@ def main():
         format="%(asctime)s %(levelname)-8s %(message)s",
     )
 
-    run(args.data_dir, args.sample, args.limit, args.output, args.klines_dir)
+    run(args.data_dir, args.sample, args.limit, args.output, args.klines_dir, args.recorded_dir)
 
 
 if __name__ == "__main__":
