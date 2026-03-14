@@ -21,7 +21,7 @@ from backtest.report import BacktestReport
 from config.settings import (
     BacktestSettings, VPINSettings, ConfirmationSettings, OBISettings,
 )
-from data.converter import trades_to_ticks
+from data.converter import trades_to_ticks, load_klines_as_candles
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ def run(
     bucket_ms: int,
     limit: int | None,
     output: str | None,
+    klines_dir: str | None = None,
 ) -> BacktestResult:
     logger.info("Loading trades from %s (bucket=%dms)", trades_dir, bucket_ms)
     t0 = time.time()
@@ -74,12 +75,27 @@ def run(
         ticks[-1].timestamp - ticks[0].timestamp if len(ticks) > 1 else 0,
     )
 
+    # Build 15-min candles for MarketStructureReader (P3/P9)
+    candles_15m = []
+    if klines_dir:
+        logger.info("Building 15-min candles from klines: %s", klines_dir)
+        candles_15m = load_klines_as_candles(klines_dir, target_interval_sec=900)
+        logger.info(
+            "Loaded %d x 15-min candles for Market Structure analysis", len(candles_15m)
+        )
+    else:
+        logger.info(
+            "No --klines-dir provided; Market Structure reader will start cold "
+            "(trend gate inactive until enough candles arrive from ticks)"
+        )
+
     obi_s, vpin_s, ce_s, bt_s = _tuned_settings()
     engine = BacktestEngine(
         obi_settings=obi_s,
         vpin_settings=vpin_s,
         confirmation_settings=ce_s,
         backtest_settings=bt_s,
+        candles_15m=candles_15m,
     )
     logger.info("Running backtest (tuned for trades-only data)...")
     t1 = time.time()
@@ -106,6 +122,15 @@ def main():
     parser.add_argument("--bucket-ms", type=int, default=60000, help="Tick bucket size in ms")
     parser.add_argument("--limit", type=int, default=None, help="Max trades to load")
     parser.add_argument("--output", default="reports/backtest_result", help="Output report path")
+    parser.add_argument(
+        "--klines-dir",
+        default=None,
+        help=(
+            "Directory with 1-min or 15-min kline CSVs (columns: timestamp, open, high, "
+            "low, close, volume). Feeds the MarketStructureReader with warm-up candles. "
+            "Example: historical_data/BTCUSDT/klines/1m"
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -113,7 +138,7 @@ def main():
         format="%(asctime)s %(levelname)-8s %(message)s",
     )
 
-    run(args.trades, args.bucket_ms, args.limit, args.output)
+    run(args.trades, args.bucket_ms, args.limit, args.output, klines_dir=args.klines_dir)
 
 
 if __name__ == "__main__":

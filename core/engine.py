@@ -93,6 +93,7 @@ class OFIEngine:
         self._last_ticker: dict[str, dict] = {}
         self._recent_trades: dict[str, deque] = {}
         self._last_decision: dict[str, Decision] = {}
+        self._feed_msg_count: dict[str, int] = {}
         self._running = False
 
         self._dashboard_interval = 5.0
@@ -189,9 +190,13 @@ class OFIEngine:
 
         # Track health for all exchanges
         if exchange == "bybit":
-            self.health.update(f"bybit-{symbol}", "connected")
+            key = f"bybit-{symbol}"
+            self._feed_msg_count[key] = self._feed_msg_count.get(key, 0) + 1
+            self.health.update(key, "connected", self._feed_msg_count[key])
         elif exchange == "binance":
-            self.health.update(f"binance-{symbol}", "connected")
+            key = f"binance-{symbol}"
+            self._feed_msg_count[key] = self._feed_msg_count.get(key, 0) + 1
+            self.health.update(key, "connected", self._feed_msg_count[key])
 
         # Use Bybit as primary when available, fallback to Binance
         # On VPS, Binance may not stream continuously; Bybit testnet is reliable
@@ -315,11 +320,13 @@ class OFIEngine:
         last_ticker = self._last_ticker.get("BTCUSDT", {})
         spot = last_ticker.get("mid_price", 0)
 
+        # Always mark deribit healthy when event arrives (spot may not be ready yet)
+        self.health.update("deribit", "connected", data.get("count", 0))
+
         if options and spot > 0:
             result = self._options.update({
                 "options_chain": options, "spot_price": spot,
             })
-            self.health.update("deribit", "connected", data.get("count", 0))
             await self._write_metric("BTC", "gex", {
                 "value": result.raw_value,
                 "multiplier": result.metadata.get("multiplier", 1.0),
@@ -495,7 +502,7 @@ class OFIEngine:
                 f.write(json.dumps(session_record) + "\n")
 
             logger.info(
-                "Paper trade log written → %s  (%d trades, PnL=%.2f)",
+                "Paper trade log written -> %s  (%d trades, PnL=%.2f)",
                 log_path, stats.total_trades, stats.total_pnl,
             )
         except Exception as exc:

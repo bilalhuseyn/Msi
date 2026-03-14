@@ -110,7 +110,7 @@ class SpoofingDetector(BaseSignalModule):
                         "implication": implication,
                     })
                     logger.info(
-                        "Spoof detected: %s @ %.2f cancelled in %dms → %s",
+                        "Spoof detected: %s @ %.2f cancelled in %dms -> %s",
                         order_info["side"], price, elapsed, implication,
                     )
                 del self._log[price]

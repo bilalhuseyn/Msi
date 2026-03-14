@@ -237,6 +237,97 @@ def _load_all_trades(trades_dir: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+#  Candle builders for MarketStructureReader
+# ---------------------------------------------------------------------------
+
+def load_klines_as_candles(
+    klines_dir: str | Path,
+    target_interval_sec: int = 900,
+) -> list:
+    """
+    Load downloaded kline CSV files and aggregate into target-interval candles
+    for the MarketStructureReader.
+
+    Expects CSV columns: timestamp, open, high, low, close, volume
+    Timestamps may be milliseconds (Binance download) or seconds.
+
+    Args:
+        klines_dir: directory containing kline_*.csv or *.csv files
+        target_interval_sec: target candle interval (900 = 15 minutes)
+
+    Returns:
+        list[Candle] sorted by timestamp ascending
+    """
+    from signals.market_structure import Candle
+
+    klines_dir = Path(klines_dir)
+    raw: list[dict] = []
+
+    csv_files = sorted(klines_dir.glob("klines_*.csv"))
+    if not csv_files:
+        csv_files = sorted(klines_dir.glob("*.csv"))
+
+    for f in csv_files:
+        with open(f, "r", newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                try:
+                    ts = float(row["timestamp"])
+                    if ts > 1e12:
+                        ts /= 1000.0  # ms -> seconds
+                    raw.append({
+                        "ts": ts,
+                        "open": float(row["open"]),
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                        "volume": float(row.get("volume", 0.0)),
+                    })
+                except (ValueError, KeyError):
+                    continue
+
+    if not raw:
+        logger.warning("No kline data found in %s", klines_dir)
+        return []
+
+    raw.sort(key=lambda r: r["ts"])
+    logger.info("Loaded %d raw klines from %s", len(raw), klines_dir)
+
+    # Aggregate source klines into target_interval_sec windows
+    candles: list = []
+    bucket_start = (int(raw[0]["ts"]) // target_interval_sec) * target_interval_sec
+    bucket: list[dict] = []
+
+    def _flush(start_ts: int, rows: list[dict]) -> None:
+        if not rows:
+            return
+        candles.append(Candle(
+            timestamp=float(start_ts),
+            open=rows[0]["open"],
+            high=max(r["high"] for r in rows),
+            low=min(r["low"] for r in rows),
+            close=rows[-1]["close"],
+            volume=sum(r["volume"] for r in rows),
+        ))
+
+    for row in raw:
+        candle_start = (int(row["ts"]) // target_interval_sec) * target_interval_sec
+        if candle_start != bucket_start:
+            _flush(bucket_start, bucket)
+            bucket_start = candle_start
+            bucket = []
+        bucket.append(row)
+
+    _flush(bucket_start, bucket)
+
+    logger.info(
+        "Aggregated %d klines -> %d x %ds candles",
+        len(raw), len(candles), target_interval_sec,
+    )
+    return candles
+
+
+# ---------------------------------------------------------------------------
 #  Tardis.dev book_snapshot_25 converter
 # ---------------------------------------------------------------------------
 
