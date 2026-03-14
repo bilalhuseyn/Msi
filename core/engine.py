@@ -453,7 +453,7 @@ class OFIEngine:
             log_path.parent.mkdir(parents=True, exist_ok=True)
 
             stats = self._paper._stats
-            positions = list(self._paper._closed_positions)
+            positions = list(self._paper._trades)
 
             session_record = {
                 "session_end": datetime.now(timezone.utc).isoformat(),
