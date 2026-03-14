@@ -87,8 +87,13 @@ class BaseFeed(abc.ABC):
 
                     await self._on_connected(ws)
 
-                    async for raw in ws:
-                        if not self._running:
+                    while self._running:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=45.0)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "[%s] No message in 45s — forcing reconnect", self.name
+                            )
                             break
                         self.health.last_message_ts = time.time()
                         self.health.message_count += 1
