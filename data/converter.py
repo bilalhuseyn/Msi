@@ -337,6 +337,7 @@ def tardis_ob_to_ticks(
     depth: int = 20,
     sample_every: int = 100,
     limit: int | None = None,
+    trades_by_sec: dict | None = None,
 ) -> list[BacktestTick]:
     """
     Convert Tardis book_snapshot_25 + trades .csv.gz files to BacktestTick list.
@@ -346,6 +347,8 @@ def tardis_ob_to_ticks(
         depth: number of OB levels to keep (max 25)
         sample_every: take every Nth OB snapshot (1=all ticks, 100=~1 per 100)
         limit: total ticks cap (None = unlimited)
+        trades_by_sec: pre-loaded trade index (avoids double-loading when caller
+            already built candles from trades). If None, loaded from data_dir.
 
     Returns:
         Sorted list of BacktestTick with real OB depth + matched trades.
@@ -364,7 +367,10 @@ def tardis_ob_to_ticks(
         len(snapshot_files), len(trade_files), data_dir,
     )
 
-    trades_by_sec = _load_tardis_trades(trade_files)
+    if trades_by_sec is None:
+        trades_by_sec = _load_tardis_trades(trade_files)
+    else:
+        logger.info("Using pre-loaded trades_by_sec (%d seconds indexed)", len(trades_by_sec))
 
     ticks: list[BacktestTick] = []
     total_rows = 0

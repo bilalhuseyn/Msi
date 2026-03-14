@@ -95,6 +95,7 @@ def run(
         depth=20,
         sample_every=sample_every,
         limit=limit,
+        trades_by_sec=trades_by_sec,  # reuse already-loaded index — no double load
     )
     load_time = time.time() - t0
     logger.info("Loaded %d ticks in %.1fs", len(ticks), load_time)
