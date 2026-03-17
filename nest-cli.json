@@ -45,6 +45,15 @@
             "compilerOptions": {
                 "tsConfigPath": "libs/shared-types/tsconfig.lib.json"
             }
+        },
+        "liquidity-monitor": {
+            "type": "application",
+            "root": "apps/liquidity-monitor",
+            "entryFile": "main",
+            "sourceRoot": "apps/liquidity-monitor/src",
+            "compilerOptions": {
+                "tsConfigPath": "apps/liquidity-monitor/tsconfig.app.json"
+            }
         }
     }
 }
