@@ -11,10 +11,12 @@ import {
   ROUTER_ABI_FRAGMENT,
   ERC20_ABI_FRAGMENT,
   FACTORY_ABI_FRAGMENT,
+  PAIR_ABI_FRAGMENT,
   DEX_LIST,
 } from './constants';
 import { SecurityService } from '../security/security.service';
 import { TelegramService } from '../telegram/telegram.service';
+import { TradingService } from '../trading/trading.service';
 
 @Injectable()
 export class MonitorService implements OnModuleInit, OnModuleDestroy {
@@ -37,6 +39,7 @@ export class MonitorService implements OnModuleInit, OnModuleDestroy {
     private readonly config: ConfigService,
     private readonly security: SecurityService,
     private readonly telegram: TelegramService,
+    private readonly trading: TradingService,
   ) {}
 
   async onModuleInit() {
@@ -169,19 +172,29 @@ export class MonitorService implements OnModuleInit, OnModuleDestroy {
         `addLiquidityETH detected: ${ethAmount} ETH for token ${tokenAddress} on ${dex?.name ?? 'Unknown DEX'}`,
       );
 
+      // Security check FIRST — gate: must be tradeable
+      const secResult = await this.security.checkToken(tokenAddress);
+
+      if (!secResult.isTradeable) {
+        this.logger.warn(
+          `BLOCKED ${tokenAddress}: ${secResult.summary} — not tradeable`,
+        );
+        return;
+      }
+
       // Get token info
       const { name, symbol } = await this.getTokenInfo(tokenAddress);
-
-      // Security check
-      const secResult = await this.security.checkToken(tokenAddress);
 
       // Get pair address
       const pairAddress = await this.getPairAddress(tokenAddress, tx.to);
 
+      // Get pool reserves for liquidity info + lot calculation
+      const poolInfo = await this.getPoolInfo(pairAddress);
+
       // Set cooldown
       this.cooldownMap.set(tokenLower, Date.now());
 
-      // Send notification
+      // Send notification with pool info and lot plan
       await this.telegram.sendLiquidityAlert({
         tokenName: name,
         tokenSymbol: symbol,
@@ -192,7 +205,25 @@ export class MonitorService implements OnModuleInit, OnModuleDestroy {
         isNewToken: isNew,
         securitySummary: secResult.summary,
         securityEmoji: secResult.emoji,
+        buyTax: secResult.buyTax,
+        sellTax: secResult.sellTax,
+        poolEthReserve: poolInfo?.ethReserve ?? null,
       });
+
+      // Attempt auto-trade if trading is enabled and ready
+      if (this.trading.isReady() && pairAddress && poolInfo) {
+        this.trading.executeBuy({
+          tokenAddress,
+          tokenSymbol: symbol,
+          pairAddress,
+          routerAddress: dex?.router ?? '',
+          poolEthReserve: poolInfo.ethReserve,
+          buyTax: secResult.buyTax ?? 0,
+          sellTax: secResult.sellTax ?? 0,
+        }).catch((err) => {
+          this.logger.error(`Auto-trade failed: ${err.message}`);
+        });
+      }
     } catch (err) {
       this.logger.error(`Error handling addLiquidityETH tx ${tx.hash}: ${err.message}`);
     }
@@ -264,5 +295,41 @@ export class MonitorService implements OnModuleInit, OnModuleDestroy {
     const lastSent = this.cooldownMap.get(tokenAddress);
     if (!lastSent) return false;
     return Date.now() - lastSent < this.cooldownMs;
+  }
+
+  /**
+   * Reads on-chain reserves from a Uniswap V2 pair to determine
+   * ETH liquidity depth (used for lot-sell planning).
+   */
+  private async getPoolInfo(
+    pairAddress: string | null,
+  ): Promise<{ ethReserve: number; tokenReserve: number } | null> {
+    if (!pairAddress) return null;
+
+    try {
+      const pair = new ethers.Contract(
+        pairAddress,
+        PAIR_ABI_FRAGMENT,
+        this.httpProvider,
+      );
+
+      const [reserves, token0] = await Promise.all([
+        pair.getReserves(),
+        pair.token0(),
+      ]);
+
+      const r0 = parseFloat(ethers.formatEther(reserves[0]));
+      const r1 = parseFloat(ethers.formatEther(reserves[1]));
+      const isWeth0 =
+        token0.toLowerCase() === WETH_ADDRESS.toLowerCase();
+
+      return {
+        ethReserve: isWeth0 ? r0 : r1,
+        tokenReserve: isWeth0 ? r1 : r0,
+      };
+    } catch (err) {
+      this.logger.warn(`Failed to read pool reserves: ${err.message}`);
+      return null;
+    }
   }
 }

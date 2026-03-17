@@ -77,3 +77,9 @@ export const ERC20_ABI_FRAGMENT = [
   'function decimals() view returns (uint8)',
   'function totalSupply() view returns (uint256)',
 ];
+
+export const PAIR_ABI_FRAGMENT = [
+  'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)',
+];
