@@ -172,8 +172,22 @@ export class MonitorService implements OnModuleInit, OnModuleDestroy {
         `addLiquidityETH detected: ${ethAmount} ETH for token ${tokenAddress} on ${dex?.name ?? 'Unknown DEX'}`,
       );
 
-      // Security check FIRST — gate: must be tradeable
-      const secResult = await this.security.checkToken(tokenAddress);
+      // Get pair address + pool reserves early (needed for position sizing)
+      const pairAddress = await this.getPairAddress(tokenAddress, tx.to);
+      const poolInfo = await this.getPoolInfo(pairAddress);
+
+      // Estimate trade position so simulation tests the ACTUAL amount
+      // (catches tokens that allow tiny sells but block larger ones)
+      const estimatedPosition = this.trading.estimatePosition(
+        poolInfo?.ethReserve ?? 0,
+      );
+
+      // Security check with realistic trade amount
+      const secResult = await this.security.checkToken(
+        tokenAddress,
+        pairAddress ?? undefined,
+        estimatedPosition > 0 ? estimatedPosition : undefined,
+      );
 
       if (!secResult.isTradeable) {
         this.logger.warn(
@@ -184,12 +198,6 @@ export class MonitorService implements OnModuleInit, OnModuleDestroy {
 
       // Get token info
       const { name, symbol } = await this.getTokenInfo(tokenAddress);
-
-      // Get pair address
-      const pairAddress = await this.getPairAddress(tokenAddress, tx.to);
-
-      // Get pool reserves for liquidity info + lot calculation
-      const poolInfo = await this.getPoolInfo(pairAddress);
 
       // Set cooldown
       this.cooldownMap.set(tokenLower, Date.now());
@@ -210,10 +218,20 @@ export class MonitorService implements OnModuleInit, OnModuleDestroy {
         poolEthReserve: poolInfo?.ethReserve ?? null,
       });
 
-      // Auto-trade disabled — notification-only mode
-      // if (this.trading.isReady() && pairAddress && poolInfo) {
-      //   this.trading.executeBuy({ ... }).catch(...);
-      // }
+      // Auto-trade if trading is enabled and ready
+      if (this.trading.isReady() && pairAddress && poolInfo) {
+        this.trading.executeBuy({
+          tokenAddress,
+          tokenSymbol: symbol,
+          pairAddress,
+          routerAddress: dex?.router ?? '',
+          poolEthReserve: poolInfo.ethReserve,
+          buyTax: secResult.buyTax ?? 0,
+          sellTax: secResult.sellTax ?? 0,
+        }).catch((err) => {
+          this.logger.error(`Auto-trade failed: ${err.message}`);
+        });
+      }
     } catch (err) {
       this.logger.error(`Error handling addLiquidityETH tx ${tx.hash}: ${err.message}`);
     }

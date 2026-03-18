@@ -54,9 +54,11 @@ export class SecurityService {
   async checkToken(
     tokenAddress: string,
     pairAddress?: string,
+    /** ETH amount to simulate (should match actual trade size) */
+    simAmountETH?: number,
   ): Promise<SecurityResult> {
     // 1) On-chain simulation (PRIMARY — works for brand-new tokens)
-    const simResult = await this.simulateSwap(tokenAddress);
+    const simResult = await this.simulateSwap(tokenAddress, simAmountETH);
 
     // 2) API checks (FALLBACK — may fail for new tokens)
     const [goplus, honeypot] = await Promise.allSettled([
@@ -126,6 +128,7 @@ export class SecurityService {
    */
   private async simulateSwap(
     tokenAddress: string,
+    simAmountETH?: number,
   ): Promise<{
     canSell: boolean;
     buyTax: number | null;
@@ -133,7 +136,11 @@ export class SecurityService {
   } | null> {
     try {
       const router = DEX_LIST[0]; // Uniswap V2
-      const simAmount = ethers.parseEther('0.001');
+      // Simulate with actual trade amount — catches max-tx traps
+      // that allow tiny sells but block real-sized ones
+      const simAmount = ethers.parseEther(
+        (simAmountETH && simAmountETH > 0.0001 ? simAmountETH : 0.001).toFixed(6),
+      );
       const path = [WETH_ADDRESS, tokenAddress];
 
       // Step 1: Get expected token output (pure math, no transfer)

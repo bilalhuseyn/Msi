@@ -65,6 +65,7 @@ export class TradingService implements OnModuleInit {
   // State
   private activeTrade: ActiveTrade | null = null;
   private tradingEnabled = false;
+  private lastKnownBalance = 0;
   private dailyStartBalance = 0;
   private dailyLoss = 0;
   private consecutiveLosses = 0;
@@ -114,6 +115,7 @@ export class TradingService implements OnModuleInit {
 
     const balance = await this.readProvider.getBalance(this.wallet.address);
     const balETH = parseFloat(ethers.formatEther(balance));
+    this.lastKnownBalance = balETH;
     this.dailyStartBalance = balETH;
 
     this.tradingEnabled = true;
@@ -131,6 +133,18 @@ export class TradingService implements OnModuleInit {
     if (this.activeTrade) return false;
     if (Date.now() < this.pausedUntil) return false;
     return true;
+  }
+
+  /**
+   * Estimate position size WITHOUT executing anything.
+   * Used by MonitorService to pass realistic amount to security simulation.
+   * Returns 0 if trading is disabled.
+   */
+  estimatePosition(poolEthReserve: number): number {
+    if (!this.tradingEnabled || !this.wallet) return 0;
+    const posFromBalance = this.lastKnownBalance * (this.positionPct / 100);
+    const posFromPool = poolEthReserve * (this.maxPoolPct / 100);
+    return Math.min(posFromBalance, posFromPool);
   }
 
   /**
@@ -154,6 +168,7 @@ export class TradingService implements OnModuleInit {
 
       // 2. Check daily loss limit
       const currentBalance = await this.getBalanceETH();
+      this.lastKnownBalance = currentBalance;
       const dailyLossPct = ((this.dailyStartBalance - currentBalance) / this.dailyStartBalance) * 100;
       if (dailyLossPct >= this.maxDailyLossPct) {
         this.logger.warn(`Daily loss limit hit: ${dailyLossPct.toFixed(1)}% >= ${this.maxDailyLossPct}%`);
