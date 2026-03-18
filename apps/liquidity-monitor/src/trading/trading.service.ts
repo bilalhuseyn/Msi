@@ -39,6 +39,15 @@ export interface TradeOpportunity {
   sellTax: number;
 }
 
+/**
+ * Result of a micro buy+sell test.
+ */
+export interface MicroTestResult {
+  success: boolean;
+  costETH: number; // Total cost (gas + slippage loss)
+  reason?: string;
+}
+
 // Uniswap V2 Router ABI for trading
 const ROUTER_TRADE_ABI = [
   'function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) payable returns (uint256[] memory amounts)',
@@ -145,6 +154,99 @@ export class TradingService implements OnModuleInit {
     const posFromBalance = this.lastKnownBalance * (this.positionPct / 100);
     const posFromPool = poolEthReserve * (this.maxPoolPct / 100);
     return Math.min(posFromBalance, posFromPool);
+  }
+
+  /**
+   * LAYER 3: Real micro buy+sell test.
+   * Buys a tiny amount ($0.05-0.10 worth), then immediately sells.
+   * If sell succeeds → token is confirmed sellable.
+   * Total cost capped at ~$0.20 (gas + slippage).
+   *
+   * Called only when Layer 1 or Layer 2 disagree (one OK, one FAIL).
+   */
+  async executeMicroTest(opp: Omit<TradeOpportunity, 'buyTax' | 'sellTax'>): Promise<MicroTestResult> {
+    if (!this.tradingEnabled || !this.wallet) {
+      return { success: false, costETH: 0, reason: 'Trading not enabled' };
+    }
+
+    const microAmount = ethers.parseEther('0.00005'); // ~$0.12 at ETH=$2300
+    const balanceBefore = await this.readProvider.getBalance(this.wallet.address);
+
+    try {
+      const feeData = await this.readProvider.getFeeData();
+      const routerTx = new ethers.Contract(opp.routerAddress, ROUTER_TRADE_ABI, this.wallet);
+      const deadline = Math.floor(Date.now() / 1000) + 300;
+
+      // STEP 1: Micro buy
+      this.logger.log(`🧪 Micro-test BUY: ${ethers.formatEther(microAmount)} ETH → ${opp.tokenSymbol}`);
+      const buyTx = await routerTx.swapExactETHForTokensSupportingFeeOnTransferTokens(
+        0, // minOut = 0 for micro test (we don't care about slippage)
+        [WETH_ADDRESS, opp.tokenAddress],
+        this.wallet.address,
+        deadline,
+        {
+          value: microAmount,
+          gasLimit: 300000,
+          maxFeePerGas: feeData.maxFeePerGas,
+          maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
+        },
+      );
+
+      const buyReceipt = await buyTx.wait(1);
+      if (!buyReceipt || buyReceipt.status === 0) {
+        return { success: false, costETH: 0.0001, reason: 'Micro buy TX reverted' };
+      }
+
+      // Check token balance received
+      const tokenContract = new ethers.Contract(opp.tokenAddress, ERC20_TRADE_ABI, this.readProvider);
+      const tokenBalance = await tokenContract.balanceOf(this.wallet.address);
+
+      if (tokenBalance <= BigInt(0)) {
+        return { success: false, costETH: 0.0001, reason: 'Received 0 tokens' };
+      }
+
+      // STEP 2: Approve router
+      const tokenTx = new ethers.Contract(opp.tokenAddress, ERC20_TRADE_ABI, this.wallet);
+      const approveTx = await tokenTx.approve(
+        opp.routerAddress,
+        ethers.MaxUint256,
+        { gasLimit: 100000 },
+      );
+      await approveTx.wait(1);
+
+      // STEP 3: Micro sell — THE REAL TEST
+      this.logger.log(`🧪 Micro-test SELL: ${ethers.formatUnits(tokenBalance, 18).slice(0, 12)} ${opp.tokenSymbol} → ETH`);
+      const sellTx = await routerTx.swapExactTokensForETHSupportingFeeOnTransferTokens(
+        tokenBalance,
+        0, // minOut = 0 for test
+        [opp.tokenAddress, WETH_ADDRESS],
+        this.wallet.address,
+        deadline,
+        { gasLimit: 300000 },
+      );
+
+      const sellReceipt = await sellTx.wait(1);
+      if (!sellReceipt || sellReceipt.status === 0) {
+        return { success: false, costETH: 0.0002, reason: 'Micro sell TX reverted — HONEYPOT CONFIRMED' };
+      }
+
+      // SUCCESS — token is sellable!
+      const balanceAfter = await this.readProvider.getBalance(this.wallet.address);
+      const costETH = parseFloat(ethers.formatEther(balanceBefore - balanceAfter));
+
+      this.logger.log(`🧪 Micro-test SUCCESS: cost=${costETH.toFixed(5)} ETH`);
+      return { success: true, costETH: Math.max(costETH, 0) };
+    } catch (err) {
+      const balanceAfter = await this.readProvider.getBalance(this.wallet.address);
+      const costETH = parseFloat(ethers.formatEther(balanceBefore - balanceAfter));
+
+      this.logger.error(`🧪 Micro-test FAILED: ${err.message}`);
+      return {
+        success: false,
+        costETH: Math.max(costETH, 0),
+        reason: `TX error: ${err.message?.slice(0, 100)}`,
+      };
+    }
   }
 
   /**

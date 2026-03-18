@@ -182,22 +182,64 @@ export class MonitorService implements OnModuleInit, OnModuleDestroy {
         poolInfo?.ethReserve ?? 0,
       );
 
-      // Security check with realistic trade amount
+      // 3-LAYER SECURITY CHECK
+      // Layer 1: Helper Kontrat Sim + Layer 2: Bytecode (parallel, ~300ms)
       const secResult = await this.security.checkToken(
         tokenAddress,
         pairAddress ?? undefined,
         estimatedPosition > 0 ? estimatedPosition : undefined,
       );
 
-      if (!secResult.isTradeable) {
+      // Get token info (parallel-safe, fetch while deciding)
+      const { name, symbol } = await this.getTokenInfo(tokenAddress);
+
+      let finalTradeable = secResult.isTradeable;
+      let finalSummary = secResult.summary;
+      let finalEmoji = secResult.emoji;
+
+      if (secResult.approvedBy === 'needs-micro-test') {
+        // ONE layer failed — Layer 3: real micro buy+sell test
+        if (this.trading.isReady() && pairAddress) {
+          this.logger.log(
+            `🧪 Starting micro-test for ${symbol} (${tokenAddress})...`,
+          );
+          const microResult = await this.trading.executeMicroTest({
+            tokenAddress,
+            tokenSymbol: symbol,
+            pairAddress,
+            routerAddress: dex?.router ?? '',
+            poolEthReserve: poolInfo?.ethReserve ?? 0,
+          });
+
+          if (microResult.success) {
+            finalTradeable = true;
+            finalSummary = `✅ Micro-test passed (lost ${microResult.costETH.toFixed(5)} ETH) | bytecode:${secResult.bytecodeRiskScore}`;
+            finalEmoji = '✅';
+            this.logger.log(
+              `✅ MICRO-TEST PASSED ${tokenAddress}: sell confirmed, cost=${microResult.costETH.toFixed(5)} ETH`,
+            );
+          } else {
+            finalTradeable = false;
+            finalSummary = `🚫 Micro-test FAILED: ${microResult.reason}`;
+            finalEmoji = '🚫';
+            this.logger.warn(
+              `🚫 MICRO-TEST FAILED ${tokenAddress}: ${microResult.reason}`,
+            );
+          }
+        } else {
+          // Trading not ready — can't micro-test, stay blocked
+          finalTradeable = false;
+          this.logger.warn(
+            `⚠️ Needs micro-test but trading not ready — skipping ${tokenAddress}`,
+          );
+        }
+      }
+
+      if (!finalTradeable && secResult.approvedBy !== 'needs-micro-test') {
         this.logger.warn(
           `BLOCKED ${tokenAddress}: ${secResult.summary} — not tradeable`,
         );
-        return;
       }
-
-      // Get token info
-      const { name, symbol } = await this.getTokenInfo(tokenAddress);
 
       // Set cooldown
       this.cooldownMap.set(tokenLower, Date.now());
@@ -211,15 +253,15 @@ export class MonitorService implements OnModuleInit, OnModuleDestroy {
         ethAmount: ethAmountNum.toFixed(2),
         dexName: dex?.name ?? 'Unknown DEX',
         isNewToken: isNew,
-        securitySummary: secResult.summary,
-        securityEmoji: secResult.emoji,
+        securitySummary: finalSummary,
+        securityEmoji: finalEmoji,
         buyTax: secResult.buyTax,
         sellTax: secResult.sellTax,
         poolEthReserve: poolInfo?.ethReserve ?? null,
       });
 
-      // Auto-trade if trading is enabled and ready
-      if (this.trading.isReady() && pairAddress && poolInfo) {
+      // Auto-trade if APPROVED (by any layer) and trading is ready
+      if (finalTradeable && this.trading.isReady() && pairAddress && poolInfo) {
         this.trading.executeBuy({
           tokenAddress,
           tokenSymbol: symbol,

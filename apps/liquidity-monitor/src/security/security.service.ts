@@ -17,6 +17,10 @@ export interface SecurityResult {
   emoji: string;
   /** true = not honeypot AND buy tax ≤10% AND sell tax ≤10% */
   isTradeable: boolean;
+  /** Which layer approved it: 'sim' | 'bytecode+sim' | 'micro-test' | null */
+  approvedBy: string | null;
+  /** Bytecode risk score (0=clean, 100=definite scam) */
+  bytecodeRiskScore: number;
 }
 
 // Router ABI for getAmountsOut (used for expected price calculation)
@@ -37,6 +41,76 @@ const CHECKER_ABI = [
 // Temporary address where we "deploy" the checker via code override
 const CHECKER_ADDR = '0x0000000000000000000000000000000000C0FFEE';
 
+// =====================================================
+// BYTECODE STATIC ANALYSIS — Function selectors & opcodes
+// =====================================================
+
+interface BytecodeFlag {
+  selector: string; // 4-byte hex (without 0x)
+  name: string;
+  severity: 'critical' | 'high' | 'medium';
+  category: string;
+  score: number;
+}
+
+const HONEYPOT_SELECTORS: BytecodeFlag[] = [
+  // CRITICAL: Blacklist functions — can block your sells
+  { selector: 'ecb3e7d6', name: 'blacklist(address)', severity: 'critical', category: 'blacklist', score: 30 },
+  { selector: '16c02129', name: 'isBlacklisted(address)', severity: 'critical', category: 'blacklist', score: 30 },
+  { selector: 'fe575a87', name: 'isBlacklisted(address)', severity: 'critical', category: 'blacklist', score: 30 },
+  { selector: '44337ea1', name: 'blacklistAddress(address)', severity: 'critical', category: 'blacklist', score: 30 },
+  { selector: 'f9f92be4', name: 'blacklist(address,bool)', severity: 'critical', category: 'blacklist', score: 30 },
+  { selector: '0ecb93c0', name: 'blacklistAccount(address)', severity: 'critical', category: 'blacklist', score: 30 },
+  { selector: '1b2ef1ca', name: 'addBlackList(address)', severity: 'critical', category: 'blacklist', score: 30 },
+  { selector: 'a4e2d634', name: 'isBlackListed(address)', severity: 'critical', category: 'blacklist', score: 30 },
+  { selector: 'e47d6060', name: 'isBlackListed(address)', severity: 'critical', category: 'blacklist', score: 30 },
+  { selector: '04a7fdfe', name: 'antiBot(address,uint256)', severity: 'critical', category: 'blacklist', score: 30 },
+
+  // CRITICAL: Mint = infinite supply dump
+  { selector: '40c10f19', name: 'mint(address,uint256)', severity: 'critical', category: 'mint', score: 30 },
+  { selector: 'a0712d68', name: 'mint(uint256)', severity: 'critical', category: 'mint', score: 30 },
+  { selector: '6a627842', name: 'mint(address)', severity: 'critical', category: 'mint', score: 30 },
+
+  // HIGH: Pause/Trading control — can disable sells
+  { selector: '8456cb59', name: 'pause()', severity: 'high', category: 'pause', score: 15 },
+  { selector: '5c975abb', name: 'paused()', severity: 'high', category: 'pause', score: 15 },
+  { selector: '02329a29', name: 'setOpenTrading(bool)', severity: 'high', category: 'trading-control', score: 15 },
+  { selector: 'c9567bf9', name: 'openTrading()', severity: 'high', category: 'trading-control', score: 15 },
+  { selector: '293230b8', name: 'openTrading()', severity: 'high', category: 'trading-control', score: 15 },
+  { selector: 'bbc0c742', name: 'tradingOpen()', severity: 'high', category: 'trading-control', score: 15 },
+  { selector: 'c9e1e4c4', name: 'setTradingEnabled(bool)', severity: 'high', category: 'trading-control', score: 15 },
+
+  // HIGH: Fee manipulation — can increase sell tax to 99% later
+  { selector: 'a2a957bb', name: 'setFees(uint256,uint256,uint256,uint256)', severity: 'high', category: 'fee-manipulation', score: 15 },
+  { selector: '08733214', name: 'setTaxFee(uint256)', severity: 'high', category: 'fee-manipulation', score: 15 },
+  { selector: 'fab355f3', name: 'setLiquidityFee(uint256)', severity: 'high', category: 'fee-manipulation', score: 15 },
+  { selector: 'a1ab19a3', name: 'setFeeRate(uint256)', severity: 'high', category: 'fee-manipulation', score: 15 },
+  { selector: '02259e9e', name: 'setTaxFeePercent(uint256)', severity: 'high', category: 'fee-manipulation', score: 15 },
+
+  // HIGH: Max TX limits — can trap large sells
+  { selector: '7d1db4a5', name: 'setMaxTxAmount(uint256)', severity: 'high', category: 'max-tx', score: 15 },
+  { selector: 'e01af92c', name: 'setMaxTxPercent(uint256)', severity: 'high', category: 'max-tx', score: 15 },
+  { selector: '1a8145bb', name: 'setMaxTxAmount(uint256)', severity: 'high', category: 'max-tx', score: 15 },
+  { selector: 'd543dbeb', name: 'setMaxTxPercent(uint256)', severity: 'high', category: 'max-tx', score: 15 },
+
+  // HIGH: Proxy/Upgrade — can change ALL logic after deploy
+  { selector: '3659cfe6', name: 'upgradeTo(address)', severity: 'high', category: 'proxy', score: 15 },
+  { selector: '4f1ef286', name: 'upgradeToAndCall(address,bytes)', severity: 'high', category: 'proxy', score: 15 },
+  { selector: '5c60da1b', name: 'implementation()', severity: 'high', category: 'proxy', score: 15 },
+
+  // MEDIUM: Fee exclusion — owner can exempt themselves
+  { selector: 'ea2f0b37', name: 'excludeFromFee(address)', severity: 'medium', category: 'fee-exclusion', score: 5 },
+  { selector: '437823ec', name: 'excludeFromFee(address)', severity: 'medium', category: 'fee-exclusion', score: 5 },
+  { selector: 'c0246668', name: 'excludeFromFees(address,bool)', severity: 'medium', category: 'fee-exclusion', score: 5 },
+];
+
+// Opcode patterns
+const DANGEROUS_OPCODES = [
+  { byte: 'ff', name: 'SELFDESTRUCT', score: 40 },
+  { byte: 'f4', name: 'DELEGATECALL', score: 25 },
+  { byte: 'f2', name: 'CALLCODE', score: 25 },
+];
+
 @Injectable()
 export class SecurityService {
   private readonly logger = new Logger(SecurityService.name);
@@ -51,81 +125,129 @@ export class SecurityService {
     this.httpProvider = new ethers.JsonRpcProvider(url);
   }
 
+  /**
+   * 3-LAYER SECURITY CHECK:
+   *
+   * Layer 1: Helper Kontrat Simülasyonu (eth_call) — ~200ms
+   * Layer 2: Bytecode Statik Analiz — ~100ms
+   *   → Both run in PARALLEL (~300ms total)
+   *
+   * Decision:
+   *   - Both OK → isTradeable = true (fast path, ~300ms)
+   *   - One FAIL → needs micro-test (caller handles, ~48s)
+   *   - Both FAIL → isTradeable = false (reject)
+   */
   async checkToken(
     tokenAddress: string,
     pairAddress?: string,
-    /** ETH amount to simulate (should match actual trade size) */
     simAmountETH?: number,
   ): Promise<SecurityResult> {
-    // 1) On-chain simulation (PRIMARY — works for brand-new tokens)
-    const simResult = await this.simulateSwap(tokenAddress, simAmountETH);
-
-    // 2) API checks (FALLBACK — may fail for new tokens)
-    const [goplus, honeypot] = await Promise.allSettled([
-      this.checkGoPlus(tokenAddress),
-      this.checkHoneypotIs(tokenAddress),
+    // Run Layer 1 + Layer 2 in PARALLEL
+    const [simResult, bytecodeResult, goplus, honeypot] = await Promise.all([
+      this.simulateSwap(tokenAddress, simAmountETH),
+      this.analyzeBytecode(tokenAddress),
+      this.checkGoPlus(tokenAddress).catch(() => null),
+      this.checkHoneypotIs(tokenAddress).catch(() => null),
     ]);
-    const gp = goplus.status === 'fulfilled' ? goplus.value : null;
-    const hp = honeypot.status === 'fulfilled' ? honeypot.value : null;
 
-    // Merge: on-chain sim is primary, APIs fill in extras
+    // Layer 1: Simulation result
     const canSell = simResult?.canSell ?? false;
-    const buyTax = simResult?.buyTax ?? gp?.buyTax ?? hp?.buyTax ?? null;
-    const sellTax = simResult?.sellTax ?? gp?.sellTax ?? hp?.sellTax ?? null;
+    const buyTax = simResult?.buyTax ?? goplus?.buyTax ?? honeypot?.buyTax ?? null;
+    const sellTax = simResult?.sellTax ?? goplus?.sellTax ?? honeypot?.sellTax ?? null;
 
-    // If sim failed entirely (no data at all), fall back to API honeypot check
-    const apiSaysHoneypot = gp?.isHoneypot || hp?.isHoneypot;
+    // Layer 2: Bytecode risk
+    const bytecodeRiskScore = bytecodeResult.score;
+    const bytecodeClean = bytecodeRiskScore < 30; // Below 30 = safe
 
+    // API fallback
+    const apiSaysHoneypot = goplus?.isHoneypot || honeypot?.isHoneypot;
+
+    // Build summary
     let summary: string;
     let emoji: string;
+    let approvedBy: string | null = null;
+
+    const taxOk =
+      (buyTax === null || buyTax <= 10) &&
+      (sellTax === null || sellTax <= 10);
 
     if (!canSell || apiSaysHoneypot) {
       summary = '🚫 Cannot sell (honeypot)';
       emoji = '🚫';
-    } else if (
-      (buyTax !== null && buyTax > 10) ||
-      (sellTax !== null && sellTax > 10)
-    ) {
+    } else if (!taxOk) {
       const taxes: string[] = [];
       if (buyTax !== null) taxes.push(`buy: ${buyTax.toFixed(1)}%`);
       if (sellTax !== null) taxes.push(`sell: ${sellTax.toFixed(1)}%`);
       summary = `⚠️ High Tax (${taxes.join(', ')})`;
       emoji = '⚠️';
-    } else if (buyTax !== null || sellTax !== null) {
+    } else if (!bytecodeClean) {
+      const flags = bytecodeResult.flags.slice(0, 3).map((f) => f.name).join(', ');
+      summary = `⚠️ Risky bytecode (score:${bytecodeRiskScore}, ${flags})`;
+      emoji = '⚠️';
+    } else {
       const taxes: string[] = [];
       if (buyTax !== null) taxes.push(`buy: ${buyTax.toFixed(1)}%`);
       if (sellTax !== null) taxes.push(`sell: ${sellTax.toFixed(1)}%`);
-      summary = `✅ Safe (${taxes.join(', ')})`;
+      summary = `✅ Safe (${taxes.length ? taxes.join(', ') : 'no tax'} | bytecode:${bytecodeRiskScore})`;
       emoji = '✅';
-    } else if (canSell) {
-      summary = '✅ Sellable (tax unknown)';
-      emoji = '✅';
-    } else {
-      summary = '❓ Unknown';
-      emoji = '❓';
     }
 
-    // GATE: tradeable = can sell + both taxes ≤ 10%
-    const isTradeable =
-      canSell &&
-      !apiSaysHoneypot &&
-      (buyTax === null || buyTax <= 10) &&
-      (sellTax === null || sellTax <= 10);
+    // GATE DECISION:
+    // Both OK → tradeable (fast path)
+    // One FAIL → needsMicroTest (caller decides)
+    // Both FAIL → not tradeable
+    const simOk = canSell && !apiSaysHoneypot && taxOk;
+    const bothOk = simOk && bytecodeClean;
+    const bothFail = !simOk && !bytecodeClean;
 
-    return { canSell, buyTax, sellTax, summary, emoji, isTradeable };
+    let isTradeable = false;
+
+    if (bothOk) {
+      // Fast path: both layers agree it's safe
+      isTradeable = true;
+      approvedBy = 'sim+bytecode';
+      this.logger.log(
+        `✅ APPROVED ${tokenAddress}: sim OK + bytecode clean (score:${bytecodeRiskScore})`,
+      );
+    } else if (bothFail) {
+      // Both layers say it's dangerous — hard reject
+      isTradeable = false;
+      approvedBy = null;
+      this.logger.warn(
+        `🚫 REJECTED ${tokenAddress}: sim FAIL + bytecode risky (score:${bytecodeRiskScore})`,
+      );
+    } else if (simOk && !bytecodeClean) {
+      // Sim says OK but bytecode is risky — needs micro-test
+      isTradeable = false; // Will be overridden by micro-test in monitor
+      approvedBy = 'needs-micro-test';
+      this.logger.warn(
+        `⚠️ MICRO-TEST NEEDED ${tokenAddress}: sim OK but bytecode risky (score:${bytecodeRiskScore}, flags: ${bytecodeResult.flags.map(f => f.name).join(', ')})`,
+      );
+    } else if (!simOk && bytecodeClean) {
+      // Bytecode clean but sim failed — needs micro-test
+      isTradeable = false;
+      approvedBy = 'needs-micro-test';
+      this.logger.warn(
+        `⚠️ MICRO-TEST NEEDED ${tokenAddress}: sim FAIL but bytecode clean (score:${bytecodeRiskScore})`,
+      );
+    }
+
+    return {
+      canSell,
+      buyTax,
+      sellTax,
+      summary,
+      emoji,
+      isTradeable,
+      approvedBy,
+      bytecodeRiskScore,
+    };
   }
 
-  /**
-   * ON-CHAIN SIMULATION using a helper contract deployed via code override.
-   *
-   * Deploys a temporary HoneypotChecker contract via eth_call + code override.
-   * The contract does buy→approve→sell in a SINGLE call:
-   * - If sell reverts → honeypot (can't sell)
-   * - Compares ETH in vs ETH out → combined buy+sell tax
-   * - Compares expected tokens vs actual tokens → buy tax
-   *
-   * No storage slot guessing needed. 100% reliable for any ERC20.
-   */
+  // ============================================================
+  // LAYER 1: On-chain Simulation via Helper Contract
+  // ============================================================
+
   private async simulateSwap(
     tokenAddress: string,
     simAmountETH?: number,
@@ -136,8 +258,6 @@ export class SecurityService {
   } | null> {
     try {
       const router = DEX_LIST[0]; // Uniswap V2
-      // Simulate with actual trade amount — catches max-tx traps
-      // that allow tiny sells but block real-sized ones
       const simAmount = ethers.parseEther(
         (simAmountETH && simAmountETH > 0.0001 ? simAmountETH : 0.001).toFixed(6),
       );
@@ -178,7 +298,6 @@ export class SecurityService {
         },
         'latest',
         {
-          // Deploy checker contract at temporary address
           [CHECKER_ADDR]: {
             code: HONEYPOT_CHECKER_BYTECODE,
             balance: ethers.toBeHex(ethers.parseEther('1')),
@@ -196,8 +315,7 @@ export class SecurityService {
         (expectedTokens - actualTokensBought) * BigInt(10000) / expectedTokens,
       ) / 100;
 
-      // Sell tax = 1 - (ethReceived / expectedEthBack)
-      // expectedEthBack = what AMM would give for actualTokensBought (pure math)
+      // Sell tax
       let sellTax = 0;
       try {
         const sellAmounts = await routerContract.getAmountsOut(
@@ -211,8 +329,6 @@ export class SecurityService {
           ) / 100;
         }
       } catch {
-        // If getAmountsOut fails for sell, use round-trip calculation
-        // sellTax ≈ (simAmount - ethReceived) / simAmount * 100 - buyTax
         sellTax = 0;
       }
 
@@ -226,9 +342,90 @@ export class SecurityService {
 
       return { canSell, buyTax: Math.max(buyTax, 0), sellTax };
     } catch (err) {
-      // ANY failure in the helper contract = cannot buy or sell = skip
       this.logger.debug(`Honeypot sim failed for ${tokenAddress}: ${err.message}`);
       return { canSell: false, buyTax: null, sellTax: null };
+    }
+  }
+
+  // ============================================================
+  // LAYER 2: Bytecode Static Analysis
+  // ============================================================
+
+  /**
+   * Fetch contract bytecode and scan for dangerous function selectors
+   * and opcodes. Returns a risk score (0-100+).
+   *
+   * PUSH4 opcode = 0x63 → followed by 4-byte selector.
+   * We search for '63' + selector in the bytecode hex string
+   * (more reliable than raw 4-byte match which can false-positive in data).
+   */
+  async analyzeBytecode(
+    tokenAddress: string,
+  ): Promise<{ score: number; flags: BytecodeFlag[]; opcodeFlags: string[] }> {
+    try {
+      const bytecode = await this.httpProvider.getCode(tokenAddress);
+
+      if (!bytecode || bytecode === '0x') {
+        // Not a contract — EOA. No risk from bytecode perspective.
+        return { score: 0, flags: [], opcodeFlags: [] };
+      }
+
+      const code = bytecode.toLowerCase().slice(2); // remove 0x prefix
+      const flags: BytecodeFlag[] = [];
+      const opcodeFlags: string[] = [];
+      let score = 0;
+
+      // Check function selectors (PUSH4 + selector)
+      for (const sel of HONEYPOT_SELECTORS) {
+        if (code.includes('63' + sel.selector)) {
+          flags.push(sel);
+          score += sel.score;
+        }
+      }
+
+      // Check dangerous opcodes
+      // Only flag SELFDESTRUCT/DELEGATECALL if they appear as actual opcodes,
+      // not inside PUSH data. Simple heuristic: check the bytecode length too.
+      for (const op of DANGEROUS_OPCODES) {
+        // SELFDESTRUCT (ff) is common in data, so require it's NOT preceded by PUSH
+        // Simple check: count occurrences — actual opcodes typically appear 1-2 times
+        if (op.byte === 'ff') {
+          // More careful: check for SELFDESTRUCT pattern (not in PUSH data)
+          // Look for ff NOT preceded by 60-7f (PUSH1-PUSH32 data range)
+          const idx = code.indexOf(op.byte);
+          if (idx >= 2) {
+            const prevByte = parseInt(code.substring(idx - 2, idx), 16);
+            // If previous byte is NOT a PUSH opcode (0x60-0x7f), it's likely real
+            if (prevByte < 0x60 || prevByte > 0x7f) {
+              opcodeFlags.push(op.name);
+              score += op.score;
+            }
+          }
+        } else if (code.includes(op.byte)) {
+          // DELEGATECALL (f4) and CALLCODE (f2) — presence is always suspicious
+          opcodeFlags.push(op.name);
+          score += op.score;
+        }
+      }
+
+      // Bonus: suspiciously small bytecode (proxy contract)
+      if (code.length < 1000) {
+        // < 500 bytes = very likely a proxy
+        score += 10;
+        opcodeFlags.push('TINY_CONTRACT');
+      }
+
+      if (flags.length > 0 || opcodeFlags.length > 0) {
+        this.logger.log(
+          `Bytecode ${tokenAddress}: score=${score} | flags=[${flags.map(f => f.name).join(', ')}] | opcodes=[${opcodeFlags.join(', ')}]`,
+        );
+      }
+
+      return { score, flags, opcodeFlags };
+    } catch (err) {
+      this.logger.debug(`Bytecode analysis failed for ${tokenAddress}: ${err.message}`);
+      // If we can't read bytecode, return neutral score
+      return { score: 0, flags: [], opcodeFlags: [] };
     }
   }
 
