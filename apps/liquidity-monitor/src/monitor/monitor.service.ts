@@ -210,20 +210,10 @@ export class MonitorService implements OnModuleInit, OnModuleDestroy {
         poolEthReserve: poolInfo?.ethReserve ?? null,
       });
 
-      // Attempt auto-trade if trading is enabled and ready
-      if (this.trading.isReady() && pairAddress && poolInfo) {
-        this.trading.executeBuy({
-          tokenAddress,
-          tokenSymbol: symbol,
-          pairAddress,
-          routerAddress: dex?.router ?? '',
-          poolEthReserve: poolInfo.ethReserve,
-          buyTax: secResult.buyTax ?? 0,
-          sellTax: secResult.sellTax ?? 0,
-        }).catch((err) => {
-          this.logger.error(`Auto-trade failed: ${err.message}`);
-        });
-      }
+      // Auto-trade disabled — notification-only mode
+      // if (this.trading.isReady() && pairAddress && poolInfo) {
+      //   this.trading.executeBuy({ ... }).catch(...);
+      // }
     } catch (err) {
       this.logger.error(`Error handling addLiquidityETH tx ${tx.hash}: ${err.message}`);
     }
