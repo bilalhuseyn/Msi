@@ -1,24 +1,19 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ethers } from 'ethers';
-import {
-  WETH_ADDRESS,
-  PAIR_ABI_FRAGMENT,
-  DEX_LIST,
-} from '../monitor/constants';
+import { PAIR_ABI_FRAGMENT } from '../monitor/constants';
+import { ChainId, ChainConfig, CHAIN_CONFIGS } from '../config/chains';
 import { TelegramService } from '../telegram/telegram.service';
 
-/**
- * Active trade being managed by the bot.
- */
 interface ActiveTrade {
+  chainId: ChainId;
   tokenAddress: string;
   pairAddress: string;
   routerAddress: string;
   tokenSymbol: string;
-  entryPriceETH: number; // price of token in ETH at buy time
-  tokensBought: bigint; // raw token amount held
-  ethSpent: number; // ETH we paid
+  entryPriceETH: number;
+  tokensBought: bigint;
+  ethSpent: number;
   buyTxHash: string;
   buyTimestamp: number;
   sellStarted: boolean;
@@ -26,9 +21,6 @@ interface ActiveTrade {
   totalEthReceived: number;
 }
 
-/**
- * Params passed from MonitorService when a trade opportunity is found.
- */
 export interface TradeOpportunity {
   tokenAddress: string;
   tokenSymbol: string;
@@ -39,16 +31,26 @@ export interface TradeOpportunity {
   sellTax: number;
 }
 
-/**
- * Result of a micro buy+sell test.
- */
 export interface MicroTestResult {
   success: boolean;
-  costETH: number; // Total cost (gas + slippage loss)
+  costETH: number;
   reason?: string;
 }
 
-// Uniswap V2 Router ABI for trading
+// Per-chain trading state
+interface ChainTradingState {
+  chainId: ChainId;
+  chainConfig: ChainConfig;
+  provider: ethers.JsonRpcProvider;
+  wallet: ethers.Wallet;
+  enabled: boolean;
+  activeTrade: ActiveTrade | null;
+  lastKnownBalance: number;
+  dailyStartBalance: number;
+  consecutiveLosses: number;
+  pausedUntil: number;
+}
+
 const ROUTER_TRADE_ABI = [
   'function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) payable returns (uint256[] memory amounts)',
   'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) payable',
@@ -66,25 +68,12 @@ const ERC20_TRADE_ABI = [
 @Injectable()
 export class TradingService implements OnModuleInit {
   private readonly logger = new Logger(TradingService.name);
+  private readonly chainStates = new Map<ChainId, ChainTradingState>();
 
-  // Providers
-  private readProvider: ethers.JsonRpcProvider;
-  private wallet: ethers.Wallet;
-
-  // State
-  private activeTrade: ActiveTrade | null = null;
-  private tradingEnabled = false;
-  private lastKnownBalance = 0;
-  private dailyStartBalance = 0;
-  private dailyLoss = 0;
-  private consecutiveLosses = 0;
-  private pausedUntil = 0;
-
-  // Config
-  private positionPct: number; // % of balance to use per trade
-  private maxPoolPct: number; // max % of pool to buy
+  // Shared config
+  private positionPct: number;
+  private maxPoolPct: number;
   private slippagePct: number;
-  private maxGasGwei: number;
   private holdTimeMs: number;
   private stopLossPct: number;
   private maxDailyLossPct: number;
@@ -96,246 +85,212 @@ export class TradingService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    const privateKey = this.config.get<string>('trading.privateKey');
-    if (!privateKey) {
-      this.logger.warn('TRADING_PRIVATE_KEY not set. Trading disabled (notification-only mode).');
-      return;
-    }
-
-    // Config
     this.positionPct = this.config.get<number>('trading.positionPct') || 50;
     this.maxPoolPct = this.config.get<number>('trading.maxPoolPct') || 3;
     this.slippagePct = this.config.get<number>('trading.slippagePct') || 5;
-    this.maxGasGwei = this.config.get<number>('trading.maxGasGwei') || 50;
     this.holdTimeMs = this.config.get<number>('trading.holdTimeMs') || 10 * 60 * 1000;
     this.stopLossPct = this.config.get<number>('trading.stopLossPct') || 15;
     this.maxDailyLossPct = this.config.get<number>('trading.maxDailyLossPct') || 30;
     this.maxConsecutiveLosses = this.config.get<number>('trading.maxConsecutiveLosses') || 3;
 
-    // Read provider (Alchemy)
-    const httpUrl = this.config.get<string>('alchemy.httpUrl');
-    const wssUrl = this.config.get<string>('alchemy.wssUrl');
-    const rpcUrl = httpUrl || (wssUrl ? wssUrl.replace('wss://', 'https://') : '');
-    this.readProvider = new ethers.JsonRpcProvider(rpcUrl);
+    const enabledChains: string[] = this.config.get('enabledChains') || ['eth'];
 
-    // Use Alchemy RPC for sending transactions
-    // Flashbots Protect drops small txs silently; Alchemy is reliable for all sizes
-    this.wallet = new ethers.Wallet(privateKey, this.readProvider);
+    for (const chainIdStr of enabledChains) {
+      const chainId = chainIdStr as ChainId;
+      const chainConfig = CHAIN_CONFIGS[chainId];
+      if (!chainConfig) continue;
 
-    const balance = await this.readProvider.getBalance(this.wallet.address);
-    const balETH = parseFloat(ethers.formatEther(balance));
-    this.lastKnownBalance = balETH;
-    this.dailyStartBalance = balETH;
+      const { privateKey, rpcUrl, maxGasGwei } = this.getChainTradingConfig(chainConfig);
+      if (!privateKey || !rpcUrl) {
+        this.logger.warn(`[${chainConfig.name}] No private key or RPC — trading disabled`);
+        continue;
+      }
 
-    this.tradingEnabled = true;
-    this.logger.log(
-      `Trading enabled | Wallet: ${this.wallet.address} | Balance: ${balETH.toFixed(4)} ETH`,
-    );
+      try {
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const wallet = new ethers.Wallet(privateKey, provider);
+        const balance = await provider.getBalance(wallet.address);
+        const balNative = parseFloat(ethers.formatEther(balance));
 
-    // Start stop-loss monitor loop
-    this.startStopLossMonitor();
+        const state: ChainTradingState = {
+          chainId,
+          chainConfig,
+          provider,
+          wallet,
+          enabled: true,
+          activeTrade: null,
+          lastKnownBalance: balNative,
+          dailyStartBalance: balNative,
+          consecutiveLosses: 0,
+          pausedUntil: 0,
+        };
+
+        this.chainStates.set(chainId, state);
+        this.startStopLossMonitor(state);
+
+        this.logger.log(
+          `[${chainConfig.name}] Trading enabled | Wallet: ${wallet.address} | Balance: ${balNative.toFixed(4)} ${chainConfig.nativeSymbol}`,
+        );
+      } catch (err) {
+        this.logger.error(`[${chainConfig.name}] Trading init failed: ${err.message}`);
+      }
+    }
+
+    if (this.chainStates.size === 0) {
+      this.logger.warn('No chains configured for trading (notification-only mode).');
+    }
   }
 
-  /** Is the bot ready to take a new trade? */
-  isReady(): boolean {
-    if (!this.tradingEnabled) return false;
-    if (this.activeTrade) return false;
-    if (Date.now() < this.pausedUntil) return false;
+  isReady(chainId?: ChainId): boolean {
+    if (!chainId) {
+      // Any chain ready?
+      for (const s of this.chainStates.values()) {
+        if (s.enabled && !s.activeTrade && Date.now() >= s.pausedUntil) return true;
+      }
+      return false;
+    }
+    const s = this.chainStates.get(chainId);
+    if (!s || !s.enabled) return false;
+    if (s.activeTrade) return false;
+    if (Date.now() < s.pausedUntil) return false;
     return true;
   }
 
-  /**
-   * Estimate position size WITHOUT executing anything.
-   * Used by MonitorService to pass realistic amount to security simulation.
-   * Returns 0 if trading is disabled.
-   */
-  estimatePosition(poolEthReserve: number): number {
-    if (!this.tradingEnabled || !this.wallet) return 0;
-    const posFromBalance = this.lastKnownBalance * (this.positionPct / 100);
+  estimatePosition(poolEthReserve: number, chainId?: ChainId): number {
+    const s = chainId ? this.chainStates.get(chainId) : this.chainStates.values().next().value;
+    if (!s || !s.enabled) return 0;
+    const posFromBalance = s.lastKnownBalance * (this.positionPct / 100);
     const posFromPool = poolEthReserve * (this.maxPoolPct / 100);
     return Math.min(posFromBalance, posFromPool);
   }
 
-  /**
-   * LAYER 3: Real micro buy+sell test.
-   * Buys a tiny amount ($0.05-0.10 worth), then immediately sells.
-   * If sell succeeds → token is confirmed sellable.
-   * Total cost capped at ~$0.20 (gas + slippage).
-   *
-   * Called only when Layer 1 or Layer 2 disagree (one OK, one FAIL).
-   */
-  async executeMicroTest(opp: Omit<TradeOpportunity, 'buyTax' | 'sellTax'>): Promise<MicroTestResult> {
-    if (!this.tradingEnabled || !this.wallet) {
-      return { success: false, costETH: 0, reason: 'Trading not enabled' };
-    }
+  // ============================================================
+  // LAYER 3: Micro buy+sell test
+  // ============================================================
 
-    const microAmount = ethers.parseEther('0.00005'); // ~$0.12 at ETH=$2300
-    const balanceBefore = await this.readProvider.getBalance(this.wallet.address);
+  async executeMicroTest(
+    opp: Omit<TradeOpportunity, 'buyTax' | 'sellTax'>,
+    chainId?: ChainId,
+  ): Promise<MicroTestResult> {
+    const s = this.getState(chainId);
+    if (!s) return { success: false, costETH: 0, reason: 'Trading not enabled' };
+
+    const wrappedNative = s.chainConfig.wrappedNative;
+    const microAmount = ethers.parseEther('0.00005');
+    const balanceBefore = await s.provider.getBalance(s.wallet.address);
 
     try {
-      const feeData = await this.readProvider.getFeeData();
-      const routerTx = new ethers.Contract(opp.routerAddress, ROUTER_TRADE_ABI, this.wallet);
+      const feeData = await s.provider.getFeeData();
+      const routerTx = new ethers.Contract(opp.routerAddress, ROUTER_TRADE_ABI, s.wallet);
       const deadline = Math.floor(Date.now() / 1000) + 300;
 
       // STEP 1: Micro buy
-      this.logger.log(`🧪 Micro-test BUY: ${ethers.formatEther(microAmount)} ETH → ${opp.tokenSymbol}`);
+      this.logger.log(`[${s.chainConfig.name}] Micro-test BUY: ${ethers.formatEther(microAmount)} ${s.chainConfig.nativeSymbol}`);
       const buyTx = await routerTx.swapExactETHForTokensSupportingFeeOnTransferTokens(
-        0, // minOut = 0 for micro test (we don't care about slippage)
-        [WETH_ADDRESS, opp.tokenAddress],
-        this.wallet.address,
-        deadline,
-        {
-          value: microAmount,
-          gasLimit: 300000,
-          maxFeePerGas: feeData.maxFeePerGas,
-          maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
-        },
+        0, [wrappedNative, opp.tokenAddress], s.wallet.address, deadline,
+        { value: microAmount, gasLimit: 300000, maxFeePerGas: feeData.maxFeePerGas, maxPriorityFeePerGas: feeData.maxPriorityFeePerGas },
       );
-
       const buyReceipt = await buyTx.wait(1);
       if (!buyReceipt || buyReceipt.status === 0) {
-        return { success: false, costETH: 0.0001, reason: 'Micro buy TX reverted' };
+        return { success: false, costETH: 0.0001, reason: 'Micro buy reverted' };
       }
 
-      // Check token balance received
-      const tokenContract = new ethers.Contract(opp.tokenAddress, ERC20_TRADE_ABI, this.readProvider);
-      const tokenBalance = await tokenContract.balanceOf(this.wallet.address);
-
+      const tokenContract = new ethers.Contract(opp.tokenAddress, ERC20_TRADE_ABI, s.provider);
+      const tokenBalance = await tokenContract.balanceOf(s.wallet.address);
       if (tokenBalance <= BigInt(0)) {
         return { success: false, costETH: 0.0001, reason: 'Received 0 tokens' };
       }
 
-      // STEP 2: Approve router
-      const tokenTx = new ethers.Contract(opp.tokenAddress, ERC20_TRADE_ABI, this.wallet);
-      const approveTx = await tokenTx.approve(
-        opp.routerAddress,
-        ethers.MaxUint256,
-        { gasLimit: 100000 },
-      );
+      // STEP 2: Approve
+      const tokenTx = new ethers.Contract(opp.tokenAddress, ERC20_TRADE_ABI, s.wallet);
+      const approveTx = await tokenTx.approve(opp.routerAddress, ethers.MaxUint256, { gasLimit: 100000 });
       await approveTx.wait(1);
 
-      // STEP 3: Micro sell — THE REAL TEST
-      this.logger.log(`🧪 Micro-test SELL: ${ethers.formatUnits(tokenBalance, 18).slice(0, 12)} ${opp.tokenSymbol} → ETH`);
+      // STEP 3: Micro sell
+      this.logger.log(`[${s.chainConfig.name}] Micro-test SELL: ${opp.tokenSymbol}`);
       const sellTx = await routerTx.swapExactTokensForETHSupportingFeeOnTransferTokens(
-        tokenBalance,
-        0, // minOut = 0 for test
-        [opp.tokenAddress, WETH_ADDRESS],
-        this.wallet.address,
-        deadline,
+        tokenBalance, 0, [opp.tokenAddress, wrappedNative], s.wallet.address, deadline,
         { gasLimit: 300000 },
       );
-
       const sellReceipt = await sellTx.wait(1);
       if (!sellReceipt || sellReceipt.status === 0) {
-        return { success: false, costETH: 0.0002, reason: 'Micro sell TX reverted — HONEYPOT CONFIRMED' };
+        return { success: false, costETH: 0.0002, reason: 'Micro sell reverted — HONEYPOT' };
       }
 
-      // SUCCESS — token is sellable!
-      const balanceAfter = await this.readProvider.getBalance(this.wallet.address);
+      const balanceAfter = await s.provider.getBalance(s.wallet.address);
       const costETH = parseFloat(ethers.formatEther(balanceBefore - balanceAfter));
-
-      this.logger.log(`🧪 Micro-test SUCCESS: cost=${costETH.toFixed(5)} ETH`);
       return { success: true, costETH: Math.max(costETH, 0) };
     } catch (err) {
-      const balanceAfter = await this.readProvider.getBalance(this.wallet.address);
+      const balanceAfter = await s.provider.getBalance(s.wallet.address);
       const costETH = parseFloat(ethers.formatEther(balanceBefore - balanceAfter));
-
-      this.logger.error(`🧪 Micro-test FAILED: ${err.message}`);
-      return {
-        success: false,
-        costETH: Math.max(costETH, 0),
-        reason: `TX error: ${err.message?.slice(0, 100)}`,
-      };
+      return { success: false, costETH: Math.max(costETH, 0), reason: err.message?.slice(0, 100) };
     }
   }
 
-  /**
-   * Execute a buy when a valid opportunity is detected.
-   * Called by MonitorService after all checks pass.
-   */
-  async executeBuy(opp: TradeOpportunity): Promise<boolean> {
-    if (!this.isReady()) {
-      this.logger.debug('Trade skipped: bot not ready');
-      return false;
-    }
+  // ============================================================
+  // Buy execution
+  // ============================================================
+
+  async executeBuy(opp: TradeOpportunity, chainId?: ChainId): Promise<boolean> {
+    const s = this.getState(chainId);
+    if (!s || !this.isReady(chainId)) return false;
+
+    const wrappedNative = s.chainConfig.wrappedNative;
+    const tag = `[${s.chainConfig.name}]`;
 
     try {
-      // 1. Gas check
-      const feeData = await this.readProvider.getFeeData();
+      const feeData = await s.provider.getFeeData();
       const gasGwei = parseFloat(ethers.formatUnits(feeData.gasPrice, 'gwei'));
-      if (gasGwei > this.maxGasGwei) {
-        this.logger.warn(`Gas too high: ${gasGwei.toFixed(1)} gwei > ${this.maxGasGwei} limit`);
+      const maxGas = this.getMaxGas(s.chainConfig);
+      if (gasGwei > maxGas) {
+        this.logger.warn(`${tag} Gas too high: ${gasGwei.toFixed(1)} > ${maxGas}`);
         return false;
       }
 
-      // 2. Check daily loss limit
-      const currentBalance = await this.getBalanceETH();
-      this.lastKnownBalance = currentBalance;
-      const dailyLossPct = ((this.dailyStartBalance - currentBalance) / this.dailyStartBalance) * 100;
+      const currentBalance = await this.getBalanceNative(s);
+      s.lastKnownBalance = currentBalance;
+
+      const dailyLossPct = ((s.dailyStartBalance - currentBalance) / s.dailyStartBalance) * 100;
       if (dailyLossPct >= this.maxDailyLossPct) {
-        this.logger.warn(`Daily loss limit hit: ${dailyLossPct.toFixed(1)}% >= ${this.maxDailyLossPct}%`);
+        this.logger.warn(`${tag} Daily loss limit hit: ${dailyLossPct.toFixed(1)}%`);
         return false;
       }
 
-      // 3. Calculate position size
       const posFromBalance = currentBalance * (this.positionPct / 100);
       const posFromPool = opp.poolEthReserve * (this.maxPoolPct / 100);
       const positionETH = Math.min(posFromBalance, posFromPool);
+      if (positionETH <= 0) return false;
 
-      if (positionETH <= 0) {
-        this.logger.warn(`No balance available for trading`);
-        return false;
-      }
+      this.logger.log(`${tag} BUY signal: ${opp.tokenSymbol} | pos=${positionETH.toFixed(4)} ${s.chainConfig.nativeSymbol} | pool=${opp.poolEthReserve.toFixed(2)} | gas=${gasGwei.toFixed(1)}`);
 
-      this.logger.log(
-        `BUY signal: ${opp.tokenSymbol} | pos=${positionETH.toFixed(4)} ETH | pool=${opp.poolEthReserve.toFixed(2)} ETH | gas=${gasGwei.toFixed(1)} gwei`,
-      );
-
-      // 4. Calculate amountOutMin with slippage
-      const routerRead = new ethers.Contract(opp.routerAddress, ROUTER_TRADE_ABI, this.readProvider);
-      const path = [WETH_ADDRESS, opp.tokenAddress];
+      const routerRead = new ethers.Contract(opp.routerAddress, ROUTER_TRADE_ABI, s.provider);
+      const path = [wrappedNative, opp.tokenAddress];
       const amountIn = ethers.parseEther(positionETH.toFixed(6));
-
       const amounts = await routerRead.getAmountsOut(amountIn, path);
-      const expectedOut = amounts[1];
-      const minOut = (expectedOut * BigInt(100 - this.slippagePct)) / BigInt(100);
+      const minOut = (amounts[1] * BigInt(100 - this.slippagePct)) / BigInt(100);
 
-      // 5. Send buy TX via Flashbots
-      const routerTx = new ethers.Contract(opp.routerAddress, ROUTER_TRADE_ABI, this.wallet);
-      const deadline = Math.floor(Date.now() / 1000) + 300; // 5 min
+      const routerTx = new ethers.Contract(opp.routerAddress, ROUTER_TRADE_ABI, s.wallet);
+      const deadline = Math.floor(Date.now() / 1000) + 300;
 
       const tx = await routerTx.swapExactETHForTokensSupportingFeeOnTransferTokens(
-        minOut,
-        path,
-        this.wallet.address,
-        deadline,
-        {
-          value: amountIn,
-          gasLimit: 300000,
-          maxFeePerGas: feeData.maxFeePerGas,
-          maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
-        },
+        minOut, path, s.wallet.address, deadline,
+        { value: amountIn, gasLimit: 300000, maxFeePerGas: feeData.maxFeePerGas, maxPriorityFeePerGas: feeData.maxPriorityFeePerGas },
       );
 
-      this.logger.log(`Buy TX sent: ${tx.hash}`);
-
-      // Wait for confirmation
+      this.logger.log(`${tag} Buy TX sent: ${tx.hash}`);
       const receipt = await tx.wait(1);
       if (!receipt || receipt.status === 0) {
-        this.logger.error(`Buy TX failed: ${tx.hash}`);
-        this.pausedUntil = Date.now() + 5 * 60 * 1000; // 5 min cooldown
+        this.logger.error(`${tag} Buy TX failed`);
+        s.pausedUntil = Date.now() + 5 * 60 * 1000;
         return false;
       }
 
-      // 6. Check actual token balance received
-      const tokenContract = new ethers.Contract(opp.tokenAddress, ERC20_TRADE_ABI, this.readProvider);
-      const tokenBalance = await tokenContract.balanceOf(this.wallet.address);
-
-      // Get entry price
+      const tokenContract = new ethers.Contract(opp.tokenAddress, ERC20_TRADE_ABI, s.provider);
+      const tokenBalance = await tokenContract.balanceOf(s.wallet.address);
       const entryPrice = this.calculatePrice(positionETH, tokenBalance);
 
-      // 7. Set active trade
-      this.activeTrade = {
+      s.activeTrade = {
+        chainId: s.chainId,
         tokenAddress: opp.tokenAddress,
         pairAddress: opp.pairAddress,
         routerAddress: opp.routerAddress,
@@ -350,319 +305,247 @@ export class TradingService implements OnModuleInit {
         totalEthReceived: 0,
       };
 
-      this.logger.log(
-        `BUY OK: ${opp.tokenSymbol} | ${positionETH.toFixed(4)} ETH -> ${ethers.formatUnits(tokenBalance, 18).slice(0, 12)} tokens`,
-      );
+      this.logger.log(`${tag} BUY OK: ${opp.tokenSymbol} | ${positionETH.toFixed(4)} ${s.chainConfig.nativeSymbol}`);
 
-      // Notify Telegram
       await this.telegram.sendTradeNotification(
-        '🟢 BUY EXECUTED',
-        opp.tokenSymbol,
-        opp.tokenAddress,
-        positionETH,
-        tx.hash,
-        `Entry: ${positionETH.toFixed(4)} ETH\nGas: ${gasGwei.toFixed(1)} gwei\nHolding for ${this.holdTimeMs / 60000} min...`,
+        '🟢 BUY EXECUTED', opp.tokenSymbol, opp.tokenAddress, positionETH, tx.hash,
+        `Entry: ${positionETH.toFixed(4)} ${s.chainConfig.nativeSymbol}\nGas: ${gasGwei.toFixed(1)} gwei`,
+        s.chainConfig,
       );
 
-      // 8. Schedule sell after hold period
-      this.scheduleSell();
-
+      this.scheduleSell(s);
       return true;
     } catch (err) {
-      this.logger.error(`Buy execution failed: ${err.message}`);
-      this.pausedUntil = Date.now() + 5 * 60 * 1000;
+      this.logger.error(`${tag} Buy failed: ${err.message}`);
+      s.pausedUntil = Date.now() + 5 * 60 * 1000;
       return false;
     }
   }
 
-  /**
-   * Schedule the sell after hold period.
-   */
-  private scheduleSell() {
+  // ============================================================
+  // Lot sell
+  // ============================================================
+
+  private scheduleSell(s: ChainTradingState) {
     setTimeout(async () => {
-      if (this.activeTrade && !this.activeTrade.sellStarted) {
-        await this.executeLotSell();
+      if (s.activeTrade && !s.activeTrade.sellStarted) {
+        await this.executeLotSell(s);
       }
     }, this.holdTimeMs);
   }
 
-  /**
-   * Hybrid Lot Sell Strategy:
-   * - Lot size = max 3% of pool reserves
-   * - Lot 1-2: immediate (recover principal)
-   * - Lot 3+: 30s apart (let arbers rebalance)
-   * - If price drops >15% from entry during sell → dump remaining
-   */
-  private async executeLotSell() {
-    const trade = this.activeTrade;
+  private async executeLotSell(s: ChainTradingState) {
+    const trade = s.activeTrade;
     if (!trade) return;
 
+    const tag = `[${s.chainConfig.name}]`;
+    const wrappedNative = s.chainConfig.wrappedNative;
     trade.sellStarted = true;
-    this.logger.log(`Starting lot sell for ${trade.tokenSymbol}...`);
+    this.logger.log(`${tag} Starting lot sell for ${trade.tokenSymbol}...`);
 
     try {
-      // 1. Approve router to spend our tokens (once, max amount)
-      const tokenContract = new ethers.Contract(trade.tokenAddress, ERC20_TRADE_ABI, this.wallet);
-      const currentAllowance = await tokenContract.allowance(this.wallet.address, trade.routerAddress);
-
+      const tokenContract = new ethers.Contract(trade.tokenAddress, ERC20_TRADE_ABI, s.wallet);
+      const currentAllowance = await tokenContract.allowance(s.wallet.address, trade.routerAddress);
       if (currentAllowance < trade.tokensBought) {
-        const approveTx = await tokenContract.approve(
-          trade.routerAddress,
-          ethers.MaxUint256,
-          { gasLimit: 100000 },
-        );
+        const approveTx = await tokenContract.approve(trade.routerAddress, ethers.MaxUint256, { gasLimit: 100000 });
         await approveTx.wait(1);
-        this.logger.log('Token approved for router');
+        this.logger.log(`${tag} Token approved`);
       }
 
-      // 2. Calculate lot sizes based on pool
-      const poolInfo = await this.getPoolReserves(trade.pairAddress);
+      const poolInfo = await this.getPoolReserves(trade.pairAddress, s);
       if (!poolInfo) {
-        this.logger.error('Cannot read pool — dumping all at once');
-        await this.sellTokens(trade, trade.tokensBought, 'emergency-dump');
+        await this.sellTokens(trade, trade.tokensBought, 'emergency-dump', s);
+        s.activeTrade = null;
         return;
       }
 
-      const maxLotTokens = this.calculateMaxLotTokens(
-        poolInfo.tokenReserve,
-        this.maxPoolPct,
-      );
+      const maxLotTokens = (poolInfo.tokenReserve * BigInt(Math.floor(this.maxPoolPct * 100))) / BigInt(10000);
+      const remainingTokens = await this.getTokenBalance(trade.tokenAddress, s);
+      const lotCount = Math.max(Math.ceil(Number(remainingTokens) / Number(maxLotTokens)), 1);
 
-      // Split into lots
-      const remainingTokens = await this.getTokenBalance(trade.tokenAddress);
-      const totalLots = Math.ceil(
-        Number(remainingTokens) / Number(maxLotTokens),
-      );
-      const lotCount = Math.max(totalLots, 1);
+      this.logger.log(`${tag} Sell plan: ${lotCount} lots`);
 
-      this.logger.log(
-        `Sell plan: ${lotCount} lots | max/lot: ${ethers.formatUnits(maxLotTokens, 18).slice(0, 10)} tokens`,
-      );
-
-      // 3. Execute lots
       for (let i = 0; i < lotCount; i++) {
-        const tokensLeft = await this.getTokenBalance(trade.tokenAddress);
+        const tokensLeft = await this.getTokenBalance(trade.tokenAddress, s);
         if (tokensLeft <= BigInt(0)) break;
 
-        // Last lot = sell everything remaining
         const lotSize = i === lotCount - 1 ? tokensLeft : maxLotTokens < tokensLeft ? maxLotTokens : tokensLeft;
 
-        // Check stop-loss before each lot
-        const currentPrice = await this.getCurrentPrice(trade.pairAddress, trade.tokenAddress);
+        const currentPrice = await this.getCurrentPrice(trade.pairAddress, trade.tokenAddress, s);
         if (currentPrice > 0) {
           const priceDrop = ((trade.entryPriceETH - currentPrice) / trade.entryPriceETH) * 100;
           if (priceDrop >= this.stopLossPct) {
-            this.logger.warn(`STOP-LOSS triggered: -${priceDrop.toFixed(1)}% — dumping remaining`);
-            await this.sellTokens(trade, tokensLeft, `stop-loss-lot${i + 1}`);
+            this.logger.warn(`${tag} STOP-LOSS: -${priceDrop.toFixed(1)}%`);
+            await this.sellTokens(trade, tokensLeft, 'stop-loss', s);
             break;
           }
         }
 
-        // Execute lot
-        const ethReceived = await this.sellTokens(trade, lotSize, `lot-${i + 1}`);
+        const ethReceived = await this.sellTokens(trade, lotSize, `lot-${i + 1}`, s);
         trade.lotsSold++;
         trade.totalEthReceived += ethReceived;
 
-        this.logger.log(
-          `Lot ${i + 1}/${lotCount}: +${ethReceived.toFixed(4)} ETH | Total: ${trade.totalEthReceived.toFixed(4)} ETH`,
-        );
-
-        // Lot 1-2: immediate, Lot 3+: wait 30s
         if (i >= 1 && i < lotCount - 1) {
-          this.logger.debug(`Waiting 30s before lot ${i + 2}...`);
           await this.sleep(30000);
         }
       }
 
-      // 4. Final P&L
+      // P&L
       const pnl = trade.totalEthReceived - trade.ethSpent;
       const pnlPct = (pnl / trade.ethSpent) * 100;
       const isWin = pnl >= 0;
 
       if (!isWin) {
-        this.consecutiveLosses++;
-        this.dailyLoss += Math.abs(pnl);
-        if (this.consecutiveLosses >= this.maxConsecutiveLosses) {
-          this.pausedUntil = Date.now() + 60 * 60 * 1000; // 1 hour pause
-          this.logger.warn(`${this.maxConsecutiveLosses} consecutive losses — pausing 1 hour`);
+        s.consecutiveLosses++;
+        if (s.consecutiveLosses >= this.maxConsecutiveLosses) {
+          s.pausedUntil = Date.now() + 60 * 60 * 1000;
+          this.logger.warn(`${tag} ${this.maxConsecutiveLosses} consecutive losses — pausing 1h`);
         }
       } else {
-        this.consecutiveLosses = 0;
+        s.consecutiveLosses = 0;
       }
 
-      this.logger.log(
-        `TRADE CLOSED: ${trade.tokenSymbol} | ${isWin ? 'WIN' : 'LOSS'} | ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ETH (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%) | ${trade.lotsSold} lots`,
-      );
+      this.logger.log(`${tag} CLOSED: ${trade.tokenSymbol} | ${isWin ? 'WIN' : 'LOSS'} | ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ${s.chainConfig.nativeSymbol} (${pnlPct.toFixed(1)}%)`);
 
-      // Telegram summary
       await this.telegram.sendTradeNotification(
         isWin ? '✅ TRADE WON' : '❌ TRADE LOST',
-        trade.tokenSymbol,
-        trade.tokenAddress,
-        trade.totalEthReceived,
-        trade.buyTxHash,
-        [
-          `Spent: ${trade.ethSpent.toFixed(4)} ETH`,
-          `Received: ${trade.totalEthReceived.toFixed(4)} ETH`,
-          `P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ETH (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`,
-          `Lots: ${trade.lotsSold}`,
-          isWin ? '' : `Consecutive losses: ${this.consecutiveLosses}`,
-        ].filter(Boolean).join('\n'),
+        trade.tokenSymbol, trade.tokenAddress, trade.totalEthReceived, trade.buyTxHash,
+        `Spent: ${trade.ethSpent.toFixed(4)} ${s.chainConfig.nativeSymbol}\nReceived: ${trade.totalEthReceived.toFixed(4)} ${s.chainConfig.nativeSymbol}\nP&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} (${pnlPct.toFixed(1)}%)\nLots: ${trade.lotsSold}`,
+        s.chainConfig,
       );
 
-      // Clear active trade
-      this.activeTrade = null;
+      s.activeTrade = null;
     } catch (err) {
-      this.logger.error(`Lot sell error: ${err.message}`);
-      // Try emergency dump
+      this.logger.error(`${tag} Lot sell error: ${err.message}`);
       try {
-        const remaining = await this.getTokenBalance(trade.tokenAddress);
-        if (remaining > BigInt(0)) {
-          await this.sellTokens(trade, remaining, 'emergency-dump');
-        }
+        const remaining = await this.getTokenBalance(trade.tokenAddress, s);
+        if (remaining > BigInt(0)) await this.sellTokens(trade, remaining, 'emergency', s);
       } catch (e2) {
-        this.logger.error(`Emergency dump also failed: ${e2.message}`);
+        this.logger.error(`${tag} Emergency dump failed: ${e2.message}`);
       }
-      this.activeTrade = null;
+      s.activeTrade = null;
     }
   }
 
-  /**
-   * Sell a specific amount of tokens for ETH.
-   */
   private async sellTokens(
-    trade: ActiveTrade,
-    tokenAmount: bigint,
-    label: string,
+    trade: ActiveTrade, tokenAmount: bigint, label: string, s: ChainTradingState,
   ): Promise<number> {
-    const router = new ethers.Contract(trade.routerAddress, ROUTER_TRADE_ABI, this.wallet);
-    const path = [trade.tokenAddress, WETH_ADDRESS];
+    const wrappedNative = s.chainConfig.wrappedNative;
+    const router = new ethers.Contract(trade.routerAddress, ROUTER_TRADE_ABI, s.wallet);
+    const path = [trade.tokenAddress, wrappedNative];
     const deadline = Math.floor(Date.now() / 1000) + 300;
 
-    // Get expected output
-    const routerRead = new ethers.Contract(trade.routerAddress, ROUTER_TRADE_ABI, this.readProvider);
     let minOut = BigInt(0);
     try {
+      const routerRead = new ethers.Contract(trade.routerAddress, ROUTER_TRADE_ABI, s.provider);
       const amounts = await routerRead.getAmountsOut(tokenAmount, path);
       minOut = (amounts[1] * BigInt(100 - this.slippagePct)) / BigInt(100);
-    } catch {
-      // If getAmountsOut fails, sell with 0 minOut (emergency)
-      this.logger.warn(`getAmountsOut failed for ${label} — selling with 0 minOut`);
-    }
+    } catch {}
 
-    const balanceBefore = await this.readProvider.getBalance(this.wallet.address);
-
+    const balBefore = await s.provider.getBalance(s.wallet.address);
     const tx = await router.swapExactTokensForETHSupportingFeeOnTransferTokens(
-      tokenAmount,
-      minOut,
-      path,
-      this.wallet.address,
-      deadline,
-      { gasLimit: 300000 },
+      tokenAmount, minOut, path, s.wallet.address, deadline, { gasLimit: 300000 },
     );
-
     const receipt = await tx.wait(1);
-    if (!receipt || receipt.status === 0) {
-      this.logger.error(`Sell TX failed (${label}): ${tx.hash}`);
-      return 0;
-    }
+    if (!receipt || receipt.status === 0) return 0;
 
-    const balanceAfter = await this.readProvider.getBalance(this.wallet.address);
-    const ethReceived = parseFloat(
-      ethers.formatEther(balanceAfter - balanceBefore),
-    );
-
-    // Gas cost correction (we paid gas too)
+    const balAfter = await s.provider.getBalance(s.wallet.address);
+    const ethReceived = parseFloat(ethers.formatEther(balAfter - balBefore));
     const gasCost = receipt.gasUsed * receipt.gasPrice;
-    const netReceived = ethReceived + parseFloat(ethers.formatEther(gasCost));
-
-    this.logger.log(`Sell ${label}: +${netReceived.toFixed(4)} ETH | TX: ${tx.hash}`);
-    return Math.max(netReceived, 0);
+    return Math.max(ethReceived + parseFloat(ethers.formatEther(gasCost)), 0);
   }
 
-  /**
-   * Stop-loss monitor — checks price every 15s while holding.
-   */
-  private startStopLossMonitor() {
+  // ============================================================
+  // Stop-loss monitor (per-chain)
+  // ============================================================
+
+  private startStopLossMonitor(s: ChainTradingState) {
+    const interval = s.chainConfig.tradingConfig.stopLossMonitorIntervalMs;
     setInterval(async () => {
-      const trade = this.activeTrade;
+      const trade = s.activeTrade;
       if (!trade || trade.sellStarted) return;
-
       try {
-        const currentPrice = await this.getCurrentPrice(trade.pairAddress, trade.tokenAddress);
+        const currentPrice = await this.getCurrentPrice(trade.pairAddress, trade.tokenAddress, s);
         if (currentPrice <= 0 || trade.entryPriceETH <= 0) return;
-
         const changePct = ((currentPrice - trade.entryPriceETH) / trade.entryPriceETH) * 100;
-
-        // Stop-loss: dump everything immediately
         if (changePct <= -this.stopLossPct) {
-          this.logger.warn(
-            `STOP-LOSS HIT: ${trade.tokenSymbol} at ${changePct.toFixed(1)}% → emergency sell`,
-          );
-          await this.executeLotSell();
+          this.logger.warn(`[${s.chainConfig.name}] STOP-LOSS HIT: ${trade.tokenSymbol} at ${changePct.toFixed(1)}%`);
+          await this.executeLotSell(s);
         }
-      } catch (err) {
-        this.logger.debug(`SL monitor error: ${err.message}`);
-      }
-    }, 15000); // Check every 15s
+      } catch {}
+    }, interval);
   }
 
-  // ================================================================
-  // Helper methods
-  // ================================================================
+  // ============================================================
+  // Helpers
+  // ============================================================
 
-  private async getBalanceETH(): Promise<number> {
-    const bal = await this.readProvider.getBalance(this.wallet.address);
+  private getState(chainId?: ChainId): ChainTradingState | null {
+    if (chainId) return this.chainStates.get(chainId) || null;
+    // Default to first enabled chain
+    const first = this.chainStates.values().next().value;
+    return first || null;
+  }
+
+  private async getBalanceNative(s: ChainTradingState): Promise<number> {
+    const bal = await s.provider.getBalance(s.wallet.address);
     return parseFloat(ethers.formatEther(bal));
   }
 
-  private async getTokenBalance(tokenAddress: string): Promise<bigint> {
-    const token = new ethers.Contract(tokenAddress, ERC20_TRADE_ABI, this.readProvider);
-    return token.balanceOf(this.wallet.address);
+  private async getTokenBalance(tokenAddress: string, s: ChainTradingState): Promise<bigint> {
+    const token = new ethers.Contract(tokenAddress, ERC20_TRADE_ABI, s.provider);
+    return token.balanceOf(s.wallet.address);
   }
 
   private async getPoolReserves(
-    pairAddress: string,
+    pairAddress: string, s: ChainTradingState,
   ): Promise<{ ethReserve: bigint; tokenReserve: bigint } | null> {
     try {
-      const pair = new ethers.Contract(pairAddress, PAIR_ABI_FRAGMENT, this.readProvider);
-      const [reserves, token0] = await Promise.all([
-        pair.getReserves(),
-        pair.token0(),
-      ]);
-      const isWeth0 = token0.toLowerCase() === WETH_ADDRESS.toLowerCase();
+      const pair = new ethers.Contract(pairAddress, PAIR_ABI_FRAGMENT, s.provider);
+      const [reserves, token0] = await Promise.all([pair.getReserves(), pair.token0()]);
+      const isWrapped0 = token0.toLowerCase() === s.chainConfig.wrappedNative.toLowerCase();
       return {
-        ethReserve: isWeth0 ? reserves[0] : reserves[1],
-        tokenReserve: isWeth0 ? reserves[1] : reserves[0],
+        ethReserve: isWrapped0 ? reserves[0] : reserves[1],
+        tokenReserve: isWrapped0 ? reserves[1] : reserves[0],
       };
-    } catch {
-      return null;
-    }
-  }
-
-  private calculateMaxLotTokens(tokenReserve: bigint, maxPct: number): bigint {
-    return (tokenReserve * BigInt(Math.floor(maxPct * 100))) / BigInt(10000);
+    } catch { return null; }
   }
 
   private async getCurrentPrice(
-    pairAddress: string,
-    tokenAddress: string,
+    pairAddress: string, tokenAddress: string, s: ChainTradingState,
   ): Promise<number> {
     try {
-      const pool = await this.getPoolReserves(pairAddress);
+      const pool = await this.getPoolReserves(pairAddress, s);
       if (!pool || pool.tokenReserve === BigInt(0)) return 0;
-      return (
-        parseFloat(ethers.formatEther(pool.ethReserve)) /
-        parseFloat(ethers.formatEther(pool.tokenReserve))
-      );
-    } catch {
-      return 0;
-    }
+      return parseFloat(ethers.formatEther(pool.ethReserve)) / parseFloat(ethers.formatEther(pool.tokenReserve));
+    } catch { return 0; }
   }
 
   private calculatePrice(ethAmount: number, tokenAmount: bigint): number {
     const tokens = parseFloat(ethers.formatEther(tokenAmount));
     return tokens > 0 ? ethAmount / tokens : 0;
+  }
+
+  private getMaxGas(chain: ChainConfig): number {
+    // Use per-chain default if not overridden globally
+    return this.config.get<number>('trading.maxGasGwei') || chain.tradingConfig.maxGasGweiDefault;
+  }
+
+  private getChainTradingConfig(chain: ChainConfig): { privateKey: string; rpcUrl: string; maxGasGwei: number } {
+    if (chain.id === 'eth') {
+      const httpUrl = this.config.get<string>('alchemy.httpUrl');
+      const wssUrl = this.config.get<string>('alchemy.wssUrl');
+      return {
+        privateKey: this.config.get<string>('trading.privateKey') || '',
+        rpcUrl: httpUrl || (wssUrl ? wssUrl.replace('wss://', 'https://') : ''),
+        maxGasGwei: this.config.get<number>('trading.maxGasGwei') || chain.tradingConfig.maxGasGweiDefault,
+      };
+    }
+    return {
+      privateKey: this.config.get<string>(`${chain.id}.privateKey`) || '',
+      rpcUrl: this.config.get<string>(`${chain.id}.httpUrl`) || '',
+      maxGasGwei: chain.tradingConfig.maxGasGweiDefault,
+    };
   }
 
   private sleep(ms: number): Promise<void> {

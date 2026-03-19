@@ -2,11 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ethers } from 'ethers';
 import axios from 'axios';
-import {
-  WETH_ADDRESS,
-  ROUTER_ABI_FRAGMENT,
-  DEX_LIST,
-} from '../monitor/constants';
+import { ChainConfig, CHAIN_CONFIGS } from '../config/chains';
 
 export interface SecurityResult {
   /** Can the token actually be sold on-chain? */
@@ -114,7 +110,8 @@ const DANGEROUS_OPCODES = [
 @Injectable()
 export class SecurityService {
   private readonly logger = new Logger(SecurityService.name);
-  private httpProvider: ethers.JsonRpcProvider;
+  /** Default ETH provider (backward compat) */
+  private defaultProvider: ethers.JsonRpcProvider;
 
   constructor(private readonly config: ConfigService) {}
 
@@ -122,7 +119,7 @@ export class SecurityService {
     const httpUrl = this.config.get<string>('alchemy.httpUrl');
     const wssUrl = this.config.get<string>('alchemy.wssUrl');
     const url = httpUrl || (wssUrl ? wssUrl.replace('wss://', 'https://') : '');
-    this.httpProvider = new ethers.JsonRpcProvider(url);
+    this.defaultProvider = new ethers.JsonRpcProvider(url);
   }
 
   /**
@@ -141,13 +138,18 @@ export class SecurityService {
     tokenAddress: string,
     pairAddress?: string,
     simAmountETH?: number,
+    chainConfig?: ChainConfig,
+    provider?: ethers.JsonRpcProvider,
   ): Promise<SecurityResult> {
+    const chain = chainConfig || CHAIN_CONFIGS.eth;
+    const prov = provider || this.defaultProvider;
+
     // Run Layer 1 + Layer 2 in PARALLEL
     const [simResult, bytecodeResult, goplus, honeypot] = await Promise.all([
-      this.simulateSwap(tokenAddress, simAmountETH),
-      this.analyzeBytecode(tokenAddress),
-      this.checkGoPlus(tokenAddress).catch(() => null),
-      this.checkHoneypotIs(tokenAddress).catch(() => null),
+      this.simulateSwap(tokenAddress, simAmountETH, chain, prov),
+      this.analyzeBytecode(tokenAddress, prov),
+      this.checkGoPlus(tokenAddress, chain).catch(() => null),
+      this.checkHoneypotIs(tokenAddress, chain).catch(() => null),
     ]);
 
     // Layer 1: Simulation result
@@ -251,23 +253,28 @@ export class SecurityService {
   private async simulateSwap(
     tokenAddress: string,
     simAmountETH?: number,
+    chain?: ChainConfig,
+    provider?: ethers.JsonRpcProvider,
   ): Promise<{
     canSell: boolean;
     buyTax: number | null;
     sellTax: number | null;
   } | null> {
     try {
-      const router = DEX_LIST[0]; // Uniswap V2
+      const c = chain || CHAIN_CONFIGS.eth;
+      const prov = provider || this.defaultProvider;
+      const router = c.dexList[0];
+      const wrappedNative = c.wrappedNative;
       const simAmount = ethers.parseEther(
         (simAmountETH && simAmountETH > 0.0001 ? simAmountETH : 0.001).toFixed(6),
       );
-      const path = [WETH_ADDRESS, tokenAddress];
+      const path = [wrappedNative, tokenAddress];
 
       // Step 1: Get expected token output (pure math, no transfer)
       const routerContract = new ethers.Contract(
         router.router,
         ROUTER_SIM_ABI,
-        this.httpProvider,
+        prov,
       );
 
       let expectedTokens: bigint;
@@ -286,10 +293,10 @@ export class SecurityService {
       const callData = checkerIface.encodeFunctionData('check', [
         router.router,
         tokenAddress,
-        WETH_ADDRESS,
+        wrappedNative,
       ]);
 
-      const result = await this.httpProvider.send('eth_call', [
+      const result = await prov.send('eth_call', [
         {
           from: CHECKER_ADDR,
           to: CHECKER_ADDR,
@@ -320,7 +327,7 @@ export class SecurityService {
       try {
         const sellAmounts = await routerContract.getAmountsOut(
           actualTokensBought,
-          [tokenAddress, WETH_ADDRESS],
+          [tokenAddress, wrappedNative],
         );
         const expectedEthBack = sellAmounts[1];
         if (expectedEthBack > BigInt(0)) {
@@ -361,9 +368,11 @@ export class SecurityService {
    */
   async analyzeBytecode(
     tokenAddress: string,
+    provider?: ethers.JsonRpcProvider,
   ): Promise<{ score: number; flags: BytecodeFlag[]; opcodeFlags: string[] }> {
     try {
-      const bytecode = await this.httpProvider.getCode(tokenAddress);
+      const prov = provider || this.defaultProvider;
+      const bytecode = await prov.getCode(tokenAddress);
 
       if (!bytecode || bytecode === '0x') {
         // Not a contract — EOA. No risk from bytecode perspective.
@@ -435,14 +444,16 @@ export class SecurityService {
 
   private async checkGoPlus(
     tokenAddress: string,
+    chain?: ChainConfig,
   ): Promise<{
     isHoneypot: boolean;
     buyTax: number | null;
     sellTax: number | null;
   }> {
     try {
+      const chainId = chain?.goPlusChainId || '1';
       const { data } = await axios.get(
-        `https://api.gopluslabs.io/api/v1/token_security/1`,
+        `https://api.gopluslabs.io/api/v1/token_security/${chainId}`,
         {
           params: { contract_addresses: tokenAddress },
           timeout: 10000,
@@ -465,16 +476,18 @@ export class SecurityService {
 
   private async checkHoneypotIs(
     tokenAddress: string,
+    chain?: ChainConfig,
   ): Promise<{
     isHoneypot: boolean;
     buyTax: number | null;
     sellTax: number | null;
   }> {
     try {
+      const chainId = chain?.honeypotIsChainId || 1;
       const { data } = await axios.get(
         `https://api.honeypot.is/v2/IsHoneypot`,
         {
-          params: { address: tokenAddress, chainID: 1 },
+          params: { address: tokenAddress, chainID: chainId },
           timeout: 10000,
         },
       );

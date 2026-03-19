@@ -1,20 +1,22 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Telegraf } from 'telegraf';
+import { ChainConfig } from '../config/chains';
 
 export interface LiquidityAlert {
+  chainConfig: ChainConfig;
   tokenName: string;
   tokenSymbol: string;
   tokenAddress: string;
   pairAddress: string;
-  ethAmount: string;
+  nativeAmount: string;
   dexName: string;
   isNewToken: boolean;
   securitySummary: string;
   securityEmoji: string;
   buyTax: number | null;
   sellTax: number | null;
-  poolEthReserve: number | null;
+  poolNativeReserve: number | null;
 }
 
 @Injectable()
@@ -47,13 +49,15 @@ export class TelegramService implements OnModuleInit {
   async sendLiquidityAlert(alert: LiquidityAlert): Promise<void> {
     if (!this.bot) return;
 
+    const chain = alert.chainConfig;
     const tokenType = alert.isNewToken ? '🆕 New Token' : '📈 Existing';
-    const dexScreener = `https://dexscreener.com/ethereum/${alert.pairAddress}`;
-    const dexTools = `https://www.dextools.io/app/ether/pair-explorer/${alert.pairAddress}`;
+    const dexScreener = `https://dexscreener.com/${chain.dexScreenerSlug}/${alert.pairAddress}`;
+    const dexTools = `https://www.dextools.io/app/${chain.dexToolsSlug}/pair-explorer/${alert.pairAddress}`;
+    const explorerToken = `${chain.explorerUrl}/token/${alert.tokenAddress}`;
 
     // Pool liquidity info
-    const poolLine = alert.poolEthReserve !== null
-      ? `<b>Pool Liquidity:</b> ${alert.poolEthReserve.toFixed(2)} ETH`
+    const poolLine = alert.poolNativeReserve !== null
+      ? `<b>Pool Liquidity:</b> ${alert.poolNativeReserve.toFixed(2)} ${chain.nativeSymbol}`
       : `<b>Pool Liquidity:</b> Unknown`;
 
     // Tax lines
@@ -62,14 +66,14 @@ export class TelegramService implements OnModuleInit {
     const taxLine = `<b>Tax:</b> Buy ${buyTaxStr} | Sell ${sellTaxStr}`;
 
     // Hybrid lot selling plan
-    const lotPlan = this.calculateLotPlan(alert.poolEthReserve);
+    const lotPlan = this.calculateLotPlan(alert.poolNativeReserve, chain.nativeSymbol);
 
     const message = [
-      `🟢 <b>NEW LIQUIDITY ADDED</b>`,
+      `🟢 <b>NEW LIQUIDITY ADDED</b> [${chain.name}]`,
       ``,
       `<b>Token:</b> ${this.escapeHtml(alert.tokenName)} ($${this.escapeHtml(alert.tokenSymbol)})`,
       `<b>Address:</b> <code>${alert.tokenAddress}</code>`,
-      `<b>ETH Added:</b> ${alert.ethAmount} ETH`,
+      `<b>${chain.nativeSymbol} Added:</b> ${alert.nativeAmount} ${chain.nativeSymbol}`,
       `<b>DEX:</b> ${this.escapeHtml(alert.dexName)}`,
       `<b>Type:</b> ${tokenType}`,
       poolLine,
@@ -79,7 +83,7 @@ export class TelegramService implements OnModuleInit {
       `📋 <b>Lot Sell Plan:</b>`,
       lotPlan,
       ``,
-      `📊 <a href="${dexScreener}">DexScreener</a> | <a href="${dexTools}">DexTools</a>`,
+      `📊 <a href="${dexScreener}">DexScreener</a> | <a href="${dexTools}">DexTools</a> | <a href="${explorerToken}">${chain.explorerName}</a>`,
     ].join('\n');
 
     try {
@@ -99,19 +103,16 @@ export class TelegramService implements OnModuleInit {
    * - Remaining lots: slow (2-3 blocks / ~30s apart, let arbers rebalance)
    * - Stop-loss: if price drops >20% mid-sell, abort remaining lots
    */
-  private calculateLotPlan(poolEthReserve: number | null): string {
-    if (!poolEthReserve || poolEthReserve <= 0) {
+  private calculateLotPlan(poolNativeReserve: number | null, nativeSymbol: string): string {
+    if (!poolNativeReserve || poolNativeReserve <= 0) {
       return `  Unknown pool — use 5 equal lots, 30s apart`;
     }
 
-    // Max sell per lot = 3% of pool ETH
-    const maxPerLot = poolEthReserve * 0.03;
-    const maxPerLotUsd = (maxPerLot * 1900).toFixed(0);
+    // Max sell per lot = 3% of pool
+    const maxPerLot = poolNativeReserve * 0.03;
 
-    // Calculate lot count for various position sizes
-    // We show a general plan since we don't know entry size yet
     const lines: string[] = [];
-    lines.push(`  Max/lot: ${maxPerLot.toFixed(3)} ETH (~$${maxPerLotUsd})`);
+    lines.push(`  Max/lot: ${maxPerLot.toFixed(3)} ${nativeSymbol}`);
     lines.push(`  Lot 1-2: ⚡ Instant (recover capital)`);
     lines.push(`  Lot 3+: 🐢 30s apart (arb recovery)`);
     lines.push(`  ⛔ Stop if price drops >20%`);
@@ -123,23 +124,29 @@ export class TelegramService implements OnModuleInit {
     title: string,
     tokenSymbol: string,
     tokenAddress: string,
-    ethAmount: number,
+    nativeAmount: number,
     txHash: string,
     details: string,
+    chain?: ChainConfig,
   ): Promise<void> {
     if (!this.bot) return;
 
-    const etherscanTx = `https://etherscan.io/tx/${txHash}`;
+    const explorerUrl = chain?.explorerUrl || 'https://etherscan.io';
+    const explorerName = chain?.explorerName || 'Etherscan';
+    const nativeSymbol = chain?.nativeSymbol || 'ETH';
+    const chainLabel = chain ? ` [${chain.name}]` : '';
+
+    const txLink = `${explorerUrl}/tx/${txHash}`;
     const message = [
-      `<b>${title}</b>`,
+      `<b>${title}</b>${chainLabel}`,
       ``,
       `<b>Token:</b> $${this.escapeHtml(tokenSymbol)}`,
       `<b>Address:</b> <code>${tokenAddress}</code>`,
-      `<b>Amount:</b> ${ethAmount.toFixed(4)} ETH`,
+      `<b>Amount:</b> ${nativeAmount.toFixed(4)} ${nativeSymbol}`,
       ``,
       this.escapeHtml(details),
       ``,
-      `<a href="${etherscanTx}">View on Etherscan</a>`,
+      `<a href="${txLink}">View on ${explorerName}</a>`,
     ].join('\n');
 
     try {
@@ -152,13 +159,17 @@ export class TelegramService implements OnModuleInit {
     }
   }
 
-  async sendStartupMessage(): Promise<void> {
+  async sendStartupMessage(chainNames?: string[]): Promise<void> {
     if (!this.bot) return;
+
+    const chainsLine = chainNames && chainNames.length > 0
+      ? `Chains: ${chainNames.join(', ')}`
+      : 'Listening for addLiquidityETH transactions...';
 
     try {
       await this.bot.telegram.sendMessage(
         this.chatId,
-        '🟢 <b>Liquidity Monitor Started</b>\nListening for addLiquidityETH transactions...',
+        `🟢 <b>Liquidity Monitor Started</b>\n${chainsLine}`,
         { parse_mode: 'HTML' },
       );
     } catch (err) {
