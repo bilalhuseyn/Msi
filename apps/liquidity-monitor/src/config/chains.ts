@@ -27,6 +27,7 @@ export interface ChainConfig {
   honeypotIsChainId: number;
   dexList: DexInfo[];
   minNativeNewToken: number;    // Minimum liquidity for new tokens (in native)
+  liquidityWaitMs: number;      // Wait before trading to filter rug pulls (0 = no wait)
   rpcConfig: {
     wssUrlEnvKey: string;
     httpUrlEnvKey: string;
@@ -58,6 +59,7 @@ export const CHAIN_CONFIGS: Record<ChainId, ChainConfig> = {
     goPlusChainId: '1',
     honeypotIsChainId: 1,
     minNativeNewToken: 1, // 1 ETH (~$2,337)
+    liquidityWaitMs: 0,  // ETH: no wait
     dexList: [
       {
         name: 'Uniswap V2',
@@ -95,7 +97,8 @@ export const CHAIN_CONFIGS: Record<ChainId, ChainConfig> = {
     dexToolsSlug: 'bnb',
     goPlusChainId: '56',
     honeypotIsChainId: 56,
-    minNativeNewToken: 5, // 5 BNB (~$3,250)
+    minNativeNewToken: 30, // 30 BNB (~$18,900) — filter low-liq rug pulls
+    liquidityWaitMs: 3 * 60 * 1000, // BSC: 3 min wait — filter rug pulls
     dexList: [
       {
         name: 'PancakeSwap V2',
@@ -128,7 +131,8 @@ export const CHAIN_CONFIGS: Record<ChainId, ChainConfig> = {
     dexToolsSlug: 'base',
     goPlusChainId: '8453',
     honeypotIsChainId: 8453,
-    minNativeNewToken: 1, // 1 ETH (~$2,337)
+    minNativeNewToken: 10, // 10 ETH (~$21,000) — filter noise, focus on quality
+    liquidityWaitMs: 0,  // Base: no wait
     dexList: [
       {
         name: 'Uniswap V2',

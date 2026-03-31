@@ -2,6 +2,8 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import configuration from './config/configuration';
 import { MonitorModule } from './monitor/monitor.module';
+import { AnalyticsModule } from './analytics/analytics.module';
+import { WatchdogModule } from './watchdog/watchdog.module';
 
 @Module({
   imports: [
@@ -14,6 +16,8 @@ import { MonitorModule } from './monitor/monitor.module';
       ],
     }),
     MonitorModule,
+    AnalyticsModule,
+    WatchdogModule,
   ],
 })
 export class AppModule {}

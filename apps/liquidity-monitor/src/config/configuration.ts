@@ -29,18 +29,18 @@ export default () => ({
   monitor: {
     // Cooldown per token in ms (12 hours)
     cooldownMs: parseInt(process.env.COOLDOWN_MS || String(12 * 60 * 60 * 1000), 10),
-    // Max pair age to be considered "new" (24 hours in seconds)
-    newTokenMaxAge: parseInt(process.env.NEW_TOKEN_MAX_AGE || String(24 * 60 * 60), 10),
+    // Max pair age to be considered "new" (10 minutes in seconds)
+    newTokenMaxAge: parseInt(process.env.NEW_TOKEN_MAX_AGE || String(10 * 60), 10),
   },
 
   trading: {
     privateKey: process.env.TRADING_PRIVATE_KEY || '',
     positionPct: parseFloat(process.env.TRADING_POSITION_PCT || '50'),
-    maxPoolPct: parseFloat(process.env.TRADING_MAX_POOL_PCT || '3'),
+    maxPoolPct: parseFloat(process.env.TRADING_MAX_POOL_PCT || '2'),
     slippagePct: parseFloat(process.env.TRADING_SLIPPAGE_PCT || '5'),
     maxGasGwei: parseFloat(process.env.TRADING_MAX_GAS_GWEI || '50'),
-    holdTimeMs: parseInt(process.env.TRADING_HOLD_TIME_MS || String(10 * 60 * 1000), 10),
-    stopLossPct: parseFloat(process.env.TRADING_STOP_LOSS_PCT || '15'),
+    holdTimeMs: parseInt(process.env.TRADING_HOLD_TIME_MS || String(7 * 60 * 1000), 10),
+    stopLossPct: parseFloat(process.env.TRADING_STOP_LOSS_PCT || '7'),
     maxDailyLossPct: parseFloat(process.env.TRADING_MAX_DAILY_LOSS_PCT || '30'),
     maxConsecutiveLosses: parseInt(process.env.TRADING_MAX_CONSECUTIVE_LOSSES || '3', 10),
   },

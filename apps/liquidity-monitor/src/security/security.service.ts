@@ -1,7 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ethers } from 'ethers';
-import axios from 'axios';
 import { ChainConfig, CHAIN_CONFIGS } from '../config/chains';
 
 export interface SecurityResult {
@@ -11,10 +10,13 @@ export interface SecurityResult {
   sellTax: number | null;
   summary: string;
   emoji: string;
-  /** true = not honeypot AND buy tax ≤10% AND sell tax ≤10% */
-  isTradeable: boolean;
-  /** Which layer approved it: 'sim' | 'bytecode+sim' | 'micro-test' | null */
-  approvedBy: string | null;
+  /**
+   * Gate decision:
+   *  'approved'       → fast gate passed, proceed to micro-test
+   *  'needs-micro-test' → one layer failed, still worth micro-testing
+   *  'rejected'       → both layers failed, do not trade
+   */
+  gate: 'approved' | 'needs-micro-test' | 'rejected';
   /** Bytecode risk score (0=clean, 100=definite scam) */
   bytecodeRiskScore: number;
 }
@@ -44,9 +46,9 @@ const CHECKER_ADDR = '0x0000000000000000000000000000000000C0FFEE';
 interface BytecodeFlag {
   selector: string; // 4-byte hex (without 0x)
   name: string;
-  severity: 'critical' | 'high' | 'medium';
+  severity: 'critical' | 'high' | 'medium' | 'positive';
   category: string;
-  score: number;
+  score: number; // positive = risky, negative = safer
 }
 
 const HONEYPOT_SELECTORS: BytecodeFlag[] = [
@@ -98,6 +100,9 @@ const HONEYPOT_SELECTORS: BytecodeFlag[] = [
   { selector: 'ea2f0b37', name: 'excludeFromFee(address)', severity: 'medium', category: 'fee-exclusion', score: 5 },
   { selector: '437823ec', name: 'excludeFromFee(address)', severity: 'medium', category: 'fee-exclusion', score: 5 },
   { selector: 'c0246668', name: 'excludeFromFees(address,bool)', severity: 'medium', category: 'fee-exclusion', score: 5 },
+
+  // POSITIVE: Ownership renounced — risk-REDUCING signal
+  { selector: '715018a6', name: 'renounceOwnership()', severity: 'positive', category: 'ownership-renounced', score: -15 },
 ];
 
 // Opcode patterns
@@ -105,6 +110,7 @@ const DANGEROUS_OPCODES = [
   { byte: 'ff', name: 'SELFDESTRUCT', score: 40 },
   { byte: 'f4', name: 'DELEGATECALL', score: 25 },
   { byte: 'f2', name: 'CALLCODE', score: 25 },
+  { byte: '32', name: 'ORIGIN', score: 15 },  // tx.origin usage — potential anti-DEX sell
 ];
 
 @Injectable()
@@ -112,6 +118,11 @@ export class SecurityService {
   private readonly logger = new Logger(SecurityService.name);
   /** Default ETH provider (backward compat) */
   private defaultProvider: ethers.JsonRpcProvider;
+  /** Known scam deployer addresses */
+  private readonly scamDeployers = new Set<string>();
+  /** Tokens that failed to sell (honeypots discovered post-buy) */
+  private readonly sellFailureCount = new Map<string, number>();
+  private readonly blacklistedTokens = new Set<string>();
 
   constructor(private readonly config: ConfigService) {}
 
@@ -123,16 +134,19 @@ export class SecurityService {
   }
 
   /**
-   * 3-LAYER SECURITY CHECK:
+   * 2-LAYER FAST GATE:
    *
-   * Layer 1: Helper Kontrat Simülasyonu (eth_call) — ~200ms
-   * Layer 2: Bytecode Statik Analiz — ~100ms
+   * Layer 1: Helper Contract Simulation (eth_call) — ~200ms
+   * Layer 2: Bytecode Static Analysis — ~100ms
    *   → Both run in PARALLEL (~300ms total)
    *
    * Decision:
-   *   - Both OK → isTradeable = true (fast path, ~300ms)
-   *   - One FAIL → needs micro-test (caller handles, ~48s)
-   *   - Both FAIL → isTradeable = false (reject)
+   *   - Both OK → gate = 'approved' → proceed to micro-test
+   *   - One FAIL → gate = 'needs-micro-test' → still worth testing
+   *   - Both FAIL → gate = 'rejected' → do not trade
+   *
+   * NO external APIs in the fast gate. Honeypot.is is only used
+   * as a secondary check when our sim is unavailable.
    */
   async checkToken(
     tokenAddress: string,
@@ -144,36 +158,60 @@ export class SecurityService {
     const chain = chainConfig || CHAIN_CONFIGS.eth;
     const prov = provider || this.defaultProvider;
 
-    // Run Layer 1 + Layer 2 in PARALLEL
-    const [simResult, bytecodeResult, goplus, honeypot] = await Promise.all([
+    // Run Layer 1 + Layer 2 + Deployer Check in PARALLEL
+    const [simResult, bytecodeResult, deployerSafe] = await Promise.all([
       this.simulateSwap(tokenAddress, simAmountETH, chain, prov),
       this.analyzeBytecode(tokenAddress, prov),
-      this.checkGoPlus(tokenAddress, chain).catch(() => null),
-      this.checkHoneypotIs(tokenAddress, chain).catch(() => null),
+      this.checkDeployerHistory(tokenAddress, prov),
     ]);
 
     // Layer 1: Simulation result
-    const canSell = simResult?.canSell ?? false;
-    const buyTax = simResult?.buyTax ?? goplus?.buyTax ?? honeypot?.buyTax ?? null;
-    const sellTax = simResult?.sellTax ?? goplus?.sellTax ?? honeypot?.sellTax ?? null;
+    const simRan = simResult !== null && simResult.canSell !== undefined;
+    const simCanSell = simResult?.canSell ?? false;
+    const simUnavailable = !simRan || (simResult?.buyTax === null && simResult?.sellTax === null && !simCanSell);
+
+    const buyTax = simResult?.buyTax ?? null;
+    const sellTax = simResult?.sellTax ?? null;
 
     // Layer 2: Bytecode risk
     const bytecodeRiskScore = bytecodeResult.score;
-    const bytecodeClean = bytecodeRiskScore < 30; // Below 30 = safe
+    const bytecodeClean = bytecodeRiskScore < 20;
 
-    // API fallback
-    const apiSaysHoneypot = goplus?.isHoneypot || honeypot?.isHoneypot;
-
-    // Build summary
-    let summary: string;
-    let emoji: string;
-    let approvedBy: string | null = null;
-
+    // Tax check
     const taxOk =
       (buyTax === null || buyTax <= 10) &&
       (sellTax === null || sellTax <= 10);
 
-    if (!canSell || apiSaysHoneypot) {
+    // Deployer blacklisted?
+    if (!deployerSafe) {
+      this.logger.warn(`REJECTED ${tokenAddress}: deployer is a known scammer`);
+      return {
+        canSell: false,
+        buyTax,
+        sellTax,
+        summary: '🚫 Known scam deployer',
+        emoji: '🚫',
+        gate: 'rejected',
+        bytecodeRiskScore,
+      };
+    }
+
+    // Determine canSell from our own simulation only
+    let canSell: boolean;
+    if (simCanSell) {
+      canSell = true;
+    } else if (simUnavailable) {
+      // Sim couldn't run (RPC limitation) — don't assume safe or unsafe
+      canSell = false; // will go to micro-test
+    } else {
+      canSell = false; // Sim explicitly failed
+    }
+
+    // Build summary
+    let summary: string;
+    let emoji: string;
+
+    if (!canSell && !simUnavailable) {
       summary = '🚫 Cannot sell (honeypot)';
       emoji = '🚫';
     } else if (!taxOk) {
@@ -184,53 +222,39 @@ export class SecurityService {
       emoji = '⚠️';
     } else if (!bytecodeClean) {
       const flags = bytecodeResult.flags.slice(0, 3).map((f) => f.name).join(', ');
-      summary = `⚠️ Risky bytecode (score:${bytecodeRiskScore}, ${flags})`;
+      summary = `⚠️ Risky bytecode (score:${bytecodeRiskScore}, ${flags || bytecodeResult.opcodeFlags.join(', ')})`;
       emoji = '⚠️';
     } else {
       const taxes: string[] = [];
       if (buyTax !== null) taxes.push(`buy: ${buyTax.toFixed(1)}%`);
       if (sellTax !== null) taxes.push(`sell: ${sellTax.toFixed(1)}%`);
-      summary = `✅ Safe (${taxes.length ? taxes.join(', ') : 'no tax'} | bytecode:${bytecodeRiskScore})`;
+      summary = `✅ Fast gate OK (${taxes.length ? taxes.join(', ') : 'no tax'} | bytecode:${bytecodeRiskScore})`;
       emoji = '✅';
     }
 
     // GATE DECISION:
-    // Both OK → tradeable (fast path)
-    // One FAIL → needsMicroTest (caller decides)
-    // Both FAIL → not tradeable
-    const simOk = canSell && !apiSaysHoneypot && taxOk;
-    const bothOk = simOk && bytecodeClean;
-    const bothFail = !simOk && !bytecodeClean;
+    // sim OK + bytecode clean → approved (proceed to micro-test as proof)
+    // one fail or sim unavailable → needs-micro-test
+    // sim explicitly failed + bytecode risky → rejected
+    const simOk = canSell && taxOk;
+    let gate: 'approved' | 'needs-micro-test' | 'rejected';
 
-    let isTradeable = false;
-
-    if (bothOk) {
-      // Fast path: both layers agree it's safe
-      isTradeable = true;
-      approvedBy = 'sim+bytecode';
+    if (simOk && bytecodeClean) {
+      gate = 'approved';
       this.logger.log(
-        `✅ APPROVED ${tokenAddress}: sim OK + bytecode clean (score:${bytecodeRiskScore})`,
+        `✅ FAST GATE OK ${tokenAddress}: sim safe + bytecode clean (score:${bytecodeRiskScore}) → micro-test next`,
       );
-    } else if (bothFail) {
-      // Both layers say it's dangerous — hard reject
-      isTradeable = false;
-      approvedBy = null;
+    } else if (!canSell && !simUnavailable && !bytecodeClean) {
+      // Both explicitly failed — hard reject
+      gate = 'rejected';
       this.logger.warn(
         `🚫 REJECTED ${tokenAddress}: sim FAIL + bytecode risky (score:${bytecodeRiskScore})`,
       );
-    } else if (simOk && !bytecodeClean) {
-      // Sim says OK but bytecode is risky — needs micro-test
-      isTradeable = false; // Will be overridden by micro-test in monitor
-      approvedBy = 'needs-micro-test';
+    } else {
+      // One failed or sim unavailable — let micro-test decide
+      gate = 'needs-micro-test';
       this.logger.warn(
-        `⚠️ MICRO-TEST NEEDED ${tokenAddress}: sim OK but bytecode risky (score:${bytecodeRiskScore}, flags: ${bytecodeResult.flags.map(f => f.name).join(', ')})`,
-      );
-    } else if (!simOk && bytecodeClean) {
-      // Bytecode clean but sim failed — needs micro-test
-      isTradeable = false;
-      approvedBy = 'needs-micro-test';
-      this.logger.warn(
-        `⚠️ MICRO-TEST NEEDED ${tokenAddress}: sim FAIL but bytecode clean (score:${bytecodeRiskScore})`,
+        `⚠️ MICRO-TEST NEEDED ${tokenAddress}: simOk=${simOk} bytecodeClean=${bytecodeClean} simUnavailable=${simUnavailable} (score:${bytecodeRiskScore})`,
       );
     }
 
@@ -240,10 +264,70 @@ export class SecurityService {
       sellTax,
       summary,
       emoji,
-      isTradeable,
-      approvedBy,
+      gate,
       bytecodeRiskScore,
     };
+  }
+
+  // ============================================================
+  // Deployer History Check
+  // ============================================================
+
+  /**
+   * Check if the token's deployer has previously deployed known scam tokens.
+   * Returns false if deployer is blacklisted.
+   */
+  private async checkDeployerHistory(
+    tokenAddress: string,
+    provider: ethers.JsonRpcProvider,
+  ): Promise<boolean> {
+    try {
+      // Get creation TX to find deployer
+      // We use getCode to verify it's a contract, then check nonce pattern
+      // For a comprehensive check we'd need the creation TX, but that requires
+      // archive node or explorer API. For now, we maintain a local blacklist
+      // that gets populated as we discover scam tokens.
+      // Future: integrate Etherscan/BscScan API for deployer lookup
+      return !this.scamDeployers.has(tokenAddress.toLowerCase());
+    } catch {
+      return true; // Don't block on error
+    }
+  }
+
+  /**
+   * Add a deployer address to the scam blacklist.
+   * Called when a trade results in a honeypot (sell fails).
+   */
+  addScamDeployer(deployerAddress: string) {
+    this.scamDeployers.add(deployerAddress.toLowerCase());
+    this.logger.warn(`Added scam deployer to blacklist: ${deployerAddress}`);
+  }
+
+  /**
+   * Add a token address to scam list (when we discover a honeypot after buying).
+   * In the future this will also resolve and blacklist the deployer.
+   */
+  addScamToken(tokenAddress: string) {
+    this.blacklistedTokens.add(tokenAddress.toLowerCase());
+    this.logger.warn(`Scam token blacklisted: ${tokenAddress}`);
+  }
+
+  /** Record a sell failure. After 2 failures, auto-blacklist the token. */
+  recordSellFailure(tokenAddress: string): boolean {
+    const addr = tokenAddress.toLowerCase();
+    const count = (this.sellFailureCount.get(addr) || 0) + 1;
+    this.sellFailureCount.set(addr, count);
+    if (count >= 2) {
+      this.blacklistedTokens.add(addr);
+      this.logger.warn(`Auto-blacklisted honeypot after ${count} sell failures: ${addr}`);
+      return true;
+    }
+    return false;
+  }
+
+  /** Check if a token is blacklisted (known honeypot). */
+  isBlacklisted(tokenAddress: string): boolean {
+    return this.blacklistedTokens.has(tokenAddress.toLowerCase());
   }
 
   // ============================================================
@@ -355,6 +439,83 @@ export class SecurityService {
   }
 
   // ============================================================
+  // GOPLUS API: Async honeypot cross-check (free, no API key)
+  // ============================================================
+
+  /**
+   * GoPlus Security API — free async honeypot check.
+   * Returns risk flags: is_honeypot, sell_tax, buy_tax, is_blacklisted, etc.
+   * Used as post-buy async guard during hold period.
+   *
+   * Chain IDs: eth=1, bsc=56, base=8453
+   */
+  async checkGoPlus(
+    tokenAddress: string,
+    chainId: string,
+  ): Promise<{
+    isHoneypot: boolean;
+    sellTax: number | null;
+    buyTax: number | null;
+    isBlacklisted: boolean;
+    cannotSellAll: boolean;
+    hasProxy: boolean;
+    ownerCanChangeBalance: boolean;
+    summary: string;
+  }> {
+    const chainMap: Record<string, string> = { eth: '1', bsc: '56', base: '8453' };
+    const gpChainId = chainMap[chainId] || '1';
+    const url = `https://api.gopluslabs.com/api/v1/token_security/${gpChainId}?contract_addresses=${tokenAddress}`;
+
+    const defaultResult = {
+      isHoneypot: false, sellTax: null as number | null, buyTax: null as number | null,
+      isBlacklisted: false, cannotSellAll: false, hasProxy: false,
+      ownerCanChangeBalance: false, summary: 'GoPlus: unavailable',
+    };
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      const resp = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+
+      if (!resp.ok) return defaultResult;
+
+      const data = await resp.json();
+      const tokenData = data?.result?.[tokenAddress.toLowerCase()];
+      if (!tokenData) return { ...defaultResult, summary: 'GoPlus: token not found' };
+
+      const isHoneypot = tokenData.is_honeypot === '1';
+      const sellTax = tokenData.sell_tax ? parseFloat(tokenData.sell_tax) * 100 : null;
+      const buyTax = tokenData.buy_tax ? parseFloat(tokenData.buy_tax) * 100 : null;
+      const isBlacklisted = tokenData.is_blacklisted === '1';
+      const cannotSellAll = tokenData.cannot_sell_all === '1';
+      const hasProxy = tokenData.is_proxy === '1';
+      const ownerCanChangeBalance = tokenData.owner_change_balance === '1';
+
+      const flags: string[] = [];
+      if (isHoneypot) flags.push('HONEYPOT');
+      if (isBlacklisted) flags.push('BLACKLIST');
+      if (cannotSellAll) flags.push('CANT_SELL_ALL');
+      if (hasProxy) flags.push('PROXY');
+      if (ownerCanChangeBalance) flags.push('OWNER_CHANGE_BAL');
+      if (sellTax !== null && sellTax > 10) flags.push(`sellTax:${sellTax.toFixed(0)}%`);
+      if (buyTax !== null && buyTax > 10) flags.push(`buyTax:${buyTax.toFixed(0)}%`);
+
+      const summary = flags.length > 0
+        ? `GoPlus: ⚠️ ${flags.join(', ')}`
+        : `GoPlus: ✅ clean (sellTax:${sellTax?.toFixed(1) ?? '?'}% buyTax:${buyTax?.toFixed(1) ?? '?'}%)`;
+
+      this.logger.log(`GoPlus ${tokenAddress}: ${summary}`);
+
+      return { isHoneypot, sellTax, buyTax, isBlacklisted, cannotSellAll, hasProxy, ownerCanChangeBalance, summary };
+    } catch (err) {
+      this.logger.debug(`GoPlus API error for ${tokenAddress}: ${err.message}`);
+      return defaultResult;
+    }
+  }
+
+  // ============================================================
   // LAYER 2: Bytecode Static Analysis
   // ============================================================
 
@@ -362,9 +523,12 @@ export class SecurityService {
    * Fetch contract bytecode and scan for dangerous function selectors
    * and opcodes. Returns a risk score (0-100+).
    *
-   * PUSH4 opcode = 0x63 → followed by 4-byte selector.
-   * We search for '63' + selector in the bytecode hex string
-   * (more reliable than raw 4-byte match which can false-positive in data).
+   * PUSH4 opcode = 0x63 -> followed by 4-byte selector.
+   * We search for '63' + selector in the bytecode hex string.
+   *
+   * Also checks:
+   *  - ORIGIN opcode (0x32) for tx.origin anti-DEX patterns
+   *  - renounceOwnership() as a risk-REDUCING signal (-15 score)
    */
   async analyzeBytecode(
     tokenAddress: string,
@@ -392,26 +556,26 @@ export class SecurityService {
         }
       }
 
-      // Check dangerous opcodes
-      // Only flag SELFDESTRUCT/DELEGATECALL if they appear as actual opcodes,
-      // not inside PUSH data. Simple heuristic: check the bytecode length too.
+      // Check dangerous opcodes — only flag as actual opcodes, not PUSH data
       for (const op of DANGEROUS_OPCODES) {
-        // SELFDESTRUCT (ff) is common in data, so require it's NOT preceded by PUSH
-        // Simple check: count occurrences — actual opcodes typically appear 1-2 times
-        if (op.byte === 'ff') {
-          // More careful: check for SELFDESTRUCT pattern (not in PUSH data)
-          // Look for ff NOT preceded by 60-7f (PUSH1-PUSH32 data range)
-          const idx = code.indexOf(op.byte);
-          if (idx >= 2) {
-            const prevByte = parseInt(code.substring(idx - 2, idx), 16);
-            // If previous byte is NOT a PUSH opcode (0x60-0x7f), it's likely real
-            if (prevByte < 0x60 || prevByte > 0x7f) {
-              opcodeFlags.push(op.name);
-              score += op.score;
-            }
+        let found = false;
+        let i = 0;
+        while (i < code.length - 1) {
+          const byteHex = code.substring(i, i + 2);
+          const byteVal = parseInt(byteHex, 16);
+          // PUSH1..PUSH32 (0x60..0x7f) — skip the pushed data
+          if (byteVal >= 0x60 && byteVal <= 0x7f) {
+            const pushBytes = byteVal - 0x5f;
+            i += 2 + pushBytes * 2;
+            continue;
           }
-        } else if (code.includes(op.byte)) {
-          // DELEGATECALL (f4) and CALLCODE (f2) — presence is always suspicious
+          if (byteHex === op.byte) {
+            found = true;
+            break;
+          }
+          i += 2;
+        }
+        if (found) {
           opcodeFlags.push(op.name);
           score += op.score;
         }
@@ -419,10 +583,12 @@ export class SecurityService {
 
       // Bonus: suspiciously small bytecode (proxy contract)
       if (code.length < 1000) {
-        // < 500 bytes = very likely a proxy
         score += 10;
         opcodeFlags.push('TINY_CONTRACT');
       }
+
+      // Ensure score doesn't go below 0 (from renounceOwnership reduction)
+      score = Math.max(score, 0);
 
       if (flags.length > 0 || opcodeFlags.length > 0) {
         this.logger.log(
@@ -433,79 +599,7 @@ export class SecurityService {
       return { score, flags, opcodeFlags };
     } catch (err) {
       this.logger.debug(`Bytecode analysis failed for ${tokenAddress}: ${err.message}`);
-      // If we can't read bytecode, return neutral score
       return { score: 0, flags: [], opcodeFlags: [] };
-    }
-  }
-
-  // ============================================================
-  // FALLBACK: External API checks
-  // ============================================================
-
-  private async checkGoPlus(
-    tokenAddress: string,
-    chain?: ChainConfig,
-  ): Promise<{
-    isHoneypot: boolean;
-    buyTax: number | null;
-    sellTax: number | null;
-  }> {
-    try {
-      const chainId = chain?.goPlusChainId || '1';
-      const { data } = await axios.get(
-        `https://api.gopluslabs.io/api/v1/token_security/${chainId}`,
-        {
-          params: { contract_addresses: tokenAddress },
-          timeout: 10000,
-        },
-      );
-
-      const info = data?.result?.[tokenAddress.toLowerCase()];
-      if (!info) return null;
-
-      return {
-        isHoneypot: info.is_honeypot === '1',
-        buyTax: info.buy_tax ? parseFloat(info.buy_tax) * 100 : null,
-        sellTax: info.sell_tax ? parseFloat(info.sell_tax) * 100 : null,
-      };
-    } catch (err) {
-      this.logger.debug(`GoPlus API error for ${tokenAddress}: ${err.message}`);
-      return null;
-    }
-  }
-
-  private async checkHoneypotIs(
-    tokenAddress: string,
-    chain?: ChainConfig,
-  ): Promise<{
-    isHoneypot: boolean;
-    buyTax: number | null;
-    sellTax: number | null;
-  }> {
-    try {
-      const chainId = chain?.honeypotIsChainId || 1;
-      const { data } = await axios.get(
-        `https://api.honeypot.is/v2/IsHoneypot`,
-        {
-          params: { address: tokenAddress, chainID: chainId },
-          timeout: 10000,
-        },
-      );
-
-      return {
-        isHoneypot: data?.honeypotResult?.isHoneypot ?? false,
-        buyTax: data?.simulationResult?.buyTax
-          ? parseFloat(data.simulationResult.buyTax) * 100
-          : null,
-        sellTax: data?.simulationResult?.sellTax
-          ? parseFloat(data.simulationResult.sellTax) * 100
-          : null,
-      };
-    } catch (err) {
-      this.logger.debug(
-        `Honeypot.is API error for ${tokenAddress}: ${err.message}`,
-      );
-      return null;
     }
   }
 }

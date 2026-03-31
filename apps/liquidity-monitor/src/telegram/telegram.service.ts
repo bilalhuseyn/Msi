@@ -17,6 +17,7 @@ export interface LiquidityAlert {
   buyTax: number | null;
   sellTax: number | null;
   poolNativeReserve: number | null;
+  nativePriceUSD?: number;
 }
 
 @Injectable()
@@ -55,9 +56,17 @@ export class TelegramService implements OnModuleInit {
     const dexTools = `https://www.dextools.io/app/${chain.dexToolsSlug}/pair-explorer/${alert.pairAddress}`;
     const explorerToken = `${chain.explorerUrl}/token/${alert.tokenAddress}`;
 
+    // USD helper
+    const usd = (amount: number) => {
+      if (alert.nativePriceUSD && alert.nativePriceUSD > 0) {
+        return ` ($${(amount * alert.nativePriceUSD).toFixed(0)})`;
+      }
+      return '';
+    };
+
     // Pool liquidity info
     const poolLine = alert.poolNativeReserve !== null
-      ? `<b>Pool Liquidity:</b> ${alert.poolNativeReserve.toFixed(2)} ${chain.nativeSymbol}`
+      ? `<b>Pool Liquidity:</b> ${alert.poolNativeReserve.toFixed(2)} ${chain.nativeSymbol}${usd(alert.poolNativeReserve)}`
       : `<b>Pool Liquidity:</b> Unknown`;
 
     // Tax lines
@@ -70,20 +79,10 @@ export class TelegramService implements OnModuleInit {
 
     const message = [
       `🟢 <b>NEW LIQUIDITY ADDED</b> [${chain.name}]`,
-      ``,
-      `<b>Token:</b> ${this.escapeHtml(alert.tokenName)} ($${this.escapeHtml(alert.tokenSymbol)})`,
-      `<b>Address:</b> <code>${alert.tokenAddress}</code>`,
-      `<b>${chain.nativeSymbol} Added:</b> ${alert.nativeAmount} ${chain.nativeSymbol}`,
-      `<b>DEX:</b> ${this.escapeHtml(alert.dexName)}`,
-      `<b>Type:</b> ${tokenType}`,
-      poolLine,
-      taxLine,
+      `<b>${this.escapeHtml(alert.tokenName)}</b> ($${this.escapeHtml(alert.tokenSymbol)})`,
       `<b>Security:</b> ${alert.securitySummary}`,
       ``,
-      `📋 <b>Lot Sell Plan:</b>`,
-      lotPlan,
-      ``,
-      `📊 <a href="${dexScreener}">DexScreener</a> | <a href="${dexTools}">DexTools</a> | <a href="${explorerToken}">${chain.explorerName}</a>`,
+      `📊 <a href="${dexScreener}">DexScreener</a>`,
     ].join('\n');
 
     try {
@@ -174,6 +173,18 @@ export class TelegramService implements OnModuleInit {
       );
     } catch (err) {
       this.logger.error(`Failed to send startup message: ${err.message}`);
+    }
+  }
+
+  async sendRawMessage(html: string): Promise<void> {
+    if (!this.bot) return;
+    try {
+      await this.bot.telegram.sendMessage(this.chatId, html, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      });
+    } catch (err) {
+      this.logger.error(`Failed to send raw message: ${err.message}`);
     }
   }
 
